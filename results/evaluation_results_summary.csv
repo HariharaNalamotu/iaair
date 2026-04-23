@@ -1,0 +1,14 @@
+config,avg_pool_size,avg_relevant_in_pool,avg_MRR@5,avg_Recall@5,avg_Recall@10,avg_time_s
+hybrid_reranker,293.2,7.6,0.95,0.2101,0.3131,7.23
+hybrid_freq_no_reranker,293.2,7.6,0.2533,0.0501,0.1218,3.74
+hybrid_interleave_no_reranker,293.2,7.6,0.5,0.1214,0.1986,3.54
+b800_hybrid_reranker,340.6,8.3,0.9333,0.2278,0.333,7.86
+b800_hybrid_freq,340.6,8.3,0.1867,0.0596,0.1154,4.66
+b800_hybrid_interleave,340.6,8.3,0.5,0.1214,0.1903,4.5
+metapath_hybrid_reranker,88.5,3.6,0.92,0.1828,0.2231,17.17
+metapath_hybrid_freq,88.5,3.6,0.4417,0.0959,0.1754,16.06
+metapath_hybrid_interleave,88.5,3.6,0.5,0.1214,0.1986,15.54
+vector_reranker,60.0,3.2,0.925,0.1661,0.1956,1.01
+vector_only,60.0,3.2,0.5,0.1214,0.1903,0.03
+vector_poolmatch_reranker,293.2,8.4,0.95,0.2393,0.3309,12.23
+vector_poolmatch_only,293.2,8.4,0.5,0.1214,0.1903,4.86

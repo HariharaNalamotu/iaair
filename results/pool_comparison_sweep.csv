@@ -1,0 +1,5 @@
+target_pool,hybrid_vec_n,hybrid_graph_k,hybrid_avg_pool,hybrid_MRR@5,hybrid_Recall@5,hybrid_time_s,vector_avg_pool,vector_MRR@5,vector_Recall@5,vector_time_s
+100,20,9,106.0,0.75,0.13,0.85,100.0,0.8583,0.1614,0.52
+150,30,9,139.3,0.7833,0.1563,1.38,150.0,0.95,0.2157,3.12
+200,40,9,168.8,0.95,0.1922,5.15,200.0,0.9,0.2114,23.12
+250,50,13,242.5,0.95,0.2129,9.8,250.0,0.9,0.2422,34.21

@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+RAG.db
+semantic_scholar_corpus/pdfs/
+.DS_Store
+.claude/
+.ipynb_checkpoints/
