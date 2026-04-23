@@ -477,8 +477,8 @@ def retrieval_budget800_hybrid_interleave(query):
 # ═══════════════════════════════════════════════════════════════════════════════
 # QUERY-AWARE META-PATH HYBRID (VEC=60, GRAPH_K=15 to match regular hybrid)
 # ═══════════════════════════════════════════════════════════════════════════════
-METAPATH_VEC = 200
-METAPATH_GK  = 20
+METAPATH_VEC = 60   # matches standard hybrid VEC → targets ~300 deduped pool
+METAPATH_GK  = 15   # matches standard hybrid GRAPH_K
 
 def _do_metapath_hybrid(query):
     vec_ids = do_vector_search(query, n_papers=METAPATH_VEC)

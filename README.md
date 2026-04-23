@@ -316,9 +316,9 @@ All 13 configurations share the same 10 queries and 250-paper ground truth with 
 | `b800_hybrid_reranker` | Vector + BFS → CrossEncoder | 80 | 14 | 1200 |
 | `b800_hybrid_freq` | Vector + BFS → frequency ranking | 80 | 14 | 1200 |
 | `b800_hybrid_interleave` | Vector + BFS → interleaved ranking | 80 | 14 | 1200 |
-| `metapath_hybrid_reranker` | Vector + query-aware BFS → CrossEncoder | 200 | 20 | ~4200 |
-| `metapath_hybrid_freq` | Vector + query-aware BFS → frequency | 200 | 20 | ~4200 |
-| `metapath_hybrid_interleave` | Vector + query-aware BFS → interleave | 200 | 20 | ~4200 |
+| `metapath_hybrid_reranker` | Vector + query-aware BFS → CrossEncoder | 60 | 15 | ~300 |
+| `metapath_hybrid_freq` | Vector + query-aware BFS → frequency | 60 | 15 | ~300 |
+| `metapath_hybrid_interleave` | Vector + query-aware BFS → interleave | 60 | 15 | ~300 |
 | `vector_reranker` | Vector only → CrossEncoder | 60 | — | 60 |
 | `vector_only` | Vector only, no reranking | 60 | — | 60 |
 | `vector_poolmatch_reranker` | Vector (pool-matched to hybrid size) → CrossEncoder | ~300 | — | ~300 |
