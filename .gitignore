@@ -10,3 +10,13 @@ semantic_scholar_corpus/pdfs/
 .claude/
 .ipynb_checkpoints/
 ingestion/ingestion_state.json
+
+# Large generated files — not stored in git
+data/vectors.npy
+data/vector_paperids.json
+data/paper_embeddings.npy
+data/paper_ids.json
+data/_extract_checkpoint.json
+
+# Neo4j dump — large binary, only needed for initial setup
+transfer/neo4j.dump
