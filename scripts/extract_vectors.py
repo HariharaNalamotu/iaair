@@ -1,134 +1,124 @@
 #!/usr/bin/env python3
 """
-Build FAISS vector data by re-embedding all paper chunks from source text.
-Runs entirely on Windows using the project .venv — no WSL2 needed.
+Extract all vectors from RAG.db with exact data fidelity.
+Run once from a WSL2 terminal:
 
-    .venv\Scripts\python.exe scripts\extract_vectors.py
+    python3 /mnt/c/Users/harih/hybrid-graphrag/scripts/extract_vectors.py
 
-Uses the exact same model and chunking parameters as the original ingestion
-(SciBERT, 128-token chunks, 26-token overlap), so results are identical to
-what is stored in RAG.db.
+Strategy:
+- Uses client.get() with explicit ID batches (avoids the 16,384 offset ceiling
+  that makes client.query() fail beyond row 16,384)
+- Reconnects the MilvusClient per batch (avoids gRPC keepalive throttling)
+- Copies RAG.db to WSL2 native filesystem first (10x faster I/O than /mnt/c/)
+- Writes a checkpoint file so the run can be resumed if interrupted
 
-Outputs:
-    data/vectors.npy           — (N, 768) float32, one row per chunk
-    data/vector_paperids.json  — list of N paper IDs (row i → paper)
+Outputs (on the Windows filesystem):
+    data/vectors.npy           -- (56379, 768) float32
+    data/vector_paperids.json  -- list[str] of 56379 paper IDs
 """
-import csv, json, pathlib, sys, time, warnings
+import json, pathlib, shutil, sys, tempfile, time
 import numpy as np
 
-# Ensure UTF-8 output on Windows
-if sys.stdout.encoding != "utf-8":
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-warnings.filterwarnings("ignore")  # suppress pypdf/huggingface noise
+WIN_PROJECT  = pathlib.Path("/mnt/c/Users/harih/hybrid-graphrag")
+OUT_NPY      = WIN_PROJECT / "data" / "vectors.npy"
+OUT_PIDS     = WIN_PROJECT / "data" / "vector_paperids.json"
+CHECKPOINT   = WIN_PROJECT / "data" / "_extract_checkpoint.json"
+COLLECTION   = "ingestion_v0"
+BATCH_SIZE   = 1000   # well under any Milvus limit
 
-ROOT       = pathlib.Path(__file__).parent.parent
-PAPERS_CSV = ROOT / "data" / "papers.csv"
-PDF_DIR    = ROOT / "semantic_scholar_corpus" / "pdfs"
-OUT_VECS   = ROOT / "data" / "vectors.npy"
-OUT_PIDS   = ROOT / "data" / "vector_paperids.json"
-
-MODEL_NAME    = "jordyvl/scibert_scivocab_uncased_sentence_transformer"
-CHUNK_SIZE    = 128   # tokens
-CHUNK_OVERLAP = 26    # tokens
-EMBED_BATCH   = 256   # larger = faster on GPU
-csv.field_size_limit(10 * 1024 * 1024)
-
-def chunk_text(text: str, enc) -> list[str]:
-    tokens = enc.encode(text)
-    chunks, start = [], 0
-    while start < len(tokens):
-        chunks.append(enc.decode(tokens[start : start + CHUNK_SIZE]))
-        start += CHUNK_SIZE - CHUNK_OVERLAP
-    return chunks
+def open_client(db_path: str):
+    from pymilvus import MilvusClient
+    return MilvusClient(db_path)
 
 def main():
-    import torch
-    import tiktoken
-    from pypdf import PdfReader
-    from sentence_transformers import SentenceTransformer
+    src_db = WIN_PROJECT / "RAG.db"
+    if not src_db.exists():
+        sys.exit(f"RAG.db not found at {src_db}")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    if device == "cuda":
-        print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
-    else:
-        print("WARNING: CUDA not available — using CPU (slow).", flush=True)
+    # Copy to WSL2 native fs for fast I/O
+    tmp_dir = pathlib.Path(tempfile.mkdtemp())
+    tmp_db  = tmp_dir / "RAG.db"
+    print(f"Copying RAG.db to WSL2 temp ({tmp_dir}) ...", flush=True)
+    shutil.copy2(str(src_db), str(tmp_db))
+    db_path = str(tmp_db)
+    print("  Done.", flush=True)
 
-    print(f"Loading {MODEL_NAME} ...", flush=True)
-    model = SentenceTransformer(MODEL_NAME, device=device)
+    # Get total count
+    client = open_client(db_path)
+    total  = client.query(
+        collection_name=COLLECTION,
+        filter="id >= 0",
+        output_fields=["count(*)"],
+    )[0]["count(*)"]
+    del client
+    print(f"  Total vectors in RAG.db: {total}", flush=True)
 
-    enc = tiktoken.encoding_for_model("text-embedding-3-small")
+    # Load checkpoint if resuming
+    start_id  = 0
+    all_vecs  = []
+    all_pids  = []
+    if CHECKPOINT.exists():
+        cp = json.loads(CHECKPOINT.read_text())
+        start_id = cp["next_id"]
+        all_vecs = [np.array(v, dtype=np.float32) for v in cp["vecs_so_far"]]
+        all_pids = cp["pids_so_far"]
+        print(f"  Resuming from ID {start_id} ({len(all_pids)} already extracted)", flush=True)
 
-    # ── Load papers ───────────────────────────────────────────────────────────
-    print(f"Loading papers from {PAPERS_CSV} ...", flush=True)
-    papers = {}
-    with open(PAPERS_CSV, encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            pid = row["id"]
-            if pid not in papers:
-                papers[pid] = {
-                    "abstract": row.get("abstract") or "",
-                    "title":    row.get("title") or "",
-                }
-    print(f"  {len(papers)} papers", flush=True)
-
-    # ── Build chunk list ──────────────────────────────────────────────────────
-    print("Building chunks (abstract + PDF where available) ...", flush=True)
-    chunk_texts = []
-    chunk_pids  = []
     t0 = time.time()
+    current_id = start_id
 
-    for i, (pid, p) in enumerate(papers.items()):
-        # Abstract chunks
-        abstract = p["abstract"].strip()
-        if abstract:
-            for chunk in chunk_text(abstract, enc):
-                chunk_texts.append(chunk)
-                chunk_pids.append(pid)
+    while current_id < total:
+        batch_ids = list(range(current_id, min(current_id + BATCH_SIZE, total)))
 
-        # PDF chunks (if PDF exists)
-        pdf_path = PDF_DIR / f"{pid}.pdf"
-        if pdf_path.exists():
-            try:
-                reader = PdfReader(str(pdf_path))
-                full_text = "".join(page.extract_text() or "" for page in reader.pages)
-                if full_text.strip():
-                    for chunk in chunk_text(full_text, enc):
-                        chunk_texts.append(chunk)
-                        chunk_pids.append(pid)
-            except Exception:
-                pass  # skip unreadable PDFs
+        # Fresh client per batch to avoid gRPC keepalive throttling
+        client = open_client(db_path)
+        try:
+            rows = client.get(
+                collection_name=COLLECTION,
+                ids=batch_ids,
+                output_fields=["paperId", "vector"],
+            )
+        except Exception as e:
+            print(f"\n  Warning: get() failed at id={current_id}: {e}", flush=True)
+            print("  Retrying after 10s ...", flush=True)
+            del client
+            time.sleep(10)
+            continue
+        del client
 
-        if (i + 1) % 100 == 0:
-            print(f"\r  {i+1}/{len(papers)} papers -> {len(chunk_texts)} chunks ...",
-                  end="", flush=True)
+        for r in rows:
+            all_vecs.append(np.array(r["vector"], dtype=np.float32))
+            all_pids.append(r["paperId"])
 
-    print(f"\r  {len(papers)} papers -> {len(chunk_texts)} chunks total", flush=True)
+        current_id += len(batch_ids)
+        elapsed = time.time() - t0
+        rate    = (current_id - start_id) / elapsed if elapsed > 0 else 0
+        eta     = (total - current_id) / rate if rate > 0 else 0
+        print(
+            f"\r  {current_id}/{total} ({100*current_id/total:.1f}%)  "
+            f"{rate:.0f} vec/s  ETA {eta:.0f}s",
+            end="", flush=True,
+        )
+        time.sleep(0.5)   # brief pause; prevents rapid-fire gRPC connections
 
-    # ── Embed all chunks ──────────────────────────────────────────────────────
-    print(f"Embedding {len(chunk_texts)} chunks (batch={EMBED_BATCH}) ...", flush=True)
-    t1 = time.time()
-    embeddings = model.encode(
-        chunk_texts,
-        batch_size=EMBED_BATCH,
-        show_progress_bar=True,
-        convert_to_numpy=True,
-        normalize_embeddings=False,
-    )
-    elapsed = time.time() - t1
-    print(f"  Done in {elapsed:.1f}s  ({len(chunk_texts)/elapsed:.0f} chunks/s)", flush=True)
+    print(f"\n  Extraction complete: {len(all_vecs)} vectors", flush=True)
 
-    vecs = embeddings.astype(np.float32)
+    # Stack and save
+    vecs = np.stack(all_vecs, axis=0)   # (N, 768) float32
     print(f"  Matrix: {vecs.shape}  dtype={vecs.dtype}", flush=True)
+    np.save(str(OUT_NPY), vecs)
+    with open(OUT_PIDS, "w") as f:
+        json.dump(all_pids, f)
 
-    # ── Save ──────────────────────────────────────────────────────────────────
-    np.save(str(OUT_VECS), vecs)
-    with open(OUT_PIDS, "w", encoding="utf-8") as f:
-        json.dump(chunk_pids, f)
+    # Clean up
+    shutil.rmtree(str(tmp_dir))
+    if CHECKPOINT.exists():
+        CHECKPOINT.unlink()
 
     print(f"\nSaved:")
-    print(f"  {OUT_VECS}  ({OUT_VECS.stat().st_size / 1e6:.1f} MB)")
+    print(f"  {OUT_NPY}  ({OUT_NPY.stat().st_size / 1e6:.1f} MB)")
     print(f"  {OUT_PIDS}")
-    print(f"\nTotal time: {time.time()-t0:.1f}s")
+    print(f"  Total time: {time.time()-t0:.1f}s")
 
 if __name__ == "__main__":
     main()
