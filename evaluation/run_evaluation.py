@@ -9,9 +9,10 @@ csv.field_size_limit(10 * 1024 * 1024)
 from collections import deque
 
 import numpy as np
-from pymilvus import MilvusClient
+import faiss
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from neo4j import GraphDatabase
+
 
 import sys, pathlib
 ROOT = pathlib.Path(__file__).parent.parent
@@ -24,8 +25,8 @@ from query_aware_graph import MetaPathBestFirstGraph
 # ═══════════════════════════════════════════════════════════════════════════════
 load_dotenv(ROOT / ".env")
 
-MILVUS_DB  = str(ROOT / "RAG.db")
-COLLECTION = "ingestion_v0"
+FAISS_VECS = ROOT / "data" / "vectors.npy"
+FAISS_PIDS = ROOT / "data" / "vector_paperids.json"
 NEO4J_URI  = os.environ["NEO4J_URI"]
 NEO4J_USER = os.environ["NEO4J_USER"]
 NEO4J_PASS = os.environ["NEO4J_PASS"]
@@ -39,11 +40,18 @@ reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 def create_embedding(texts):
     return embed_model.encode(texts)
 
-print("Connecting to Milvus...")
-client = MilvusClient(MILVUS_DB)
-count = client.query(collection_name=COLLECTION, filter="id >= 0",
-                     output_fields=["count(*)"])[0]["count(*)"]
-print(f"  Milvus: {count} vectors")
+print("Loading FAISS index...")
+if not FAISS_VECS.exists() or not FAISS_PIDS.exists():
+    sys.exit(
+        "FAISS data not found. Run the one-time extraction in WSL2 first:\n"
+        "  python scripts/extract_vectors.py"
+    )
+_raw_vecs    = np.load(str(FAISS_VECS))             # (N, 768) float32
+_vector_pids = json.load(open(FAISS_PIDS))           # list of N paper IDs
+faiss.normalize_L2(_raw_vecs)                        # cosine sim via inner product
+_faiss_index = faiss.IndexFlatIP(_raw_vecs.shape[1])
+_faiss_index.add(_raw_vecs)
+print(f"  FAISS: {_faiss_index.ntotal} vectors ({_raw_vecs.shape[1]}-dim)")
 
 print("Connecting to Neo4j...")
 driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
@@ -122,15 +130,34 @@ with open(ROOT / "data" / "papers.csv", encoding="utf-8") as f:
             }
 print(f"  {len(all_papers)} papers loaded")
 
-# Precompute paper embeddings for meta-path best-first graph retrieval
-print("Precomputing paper embeddings (title + abstract)...")
-_paper_id_list = list(all_papers.keys())
-_paper_texts = [
-    (all_papers[pid]["title"] + " " + all_papers[pid]["abstract"]).strip()
-    for pid in _paper_id_list
-]
-_paper_emb_matrix = embed_model.encode(_paper_texts, batch_size=32, show_progress_bar=True)
-paper_embeddings = {pid: emb for pid, emb in zip(_paper_id_list, _paper_emb_matrix)}
+# Load pre-computed paper embeddings (run scripts/precompute_embeddings.py to build cache)
+EMB_NPY  = ROOT / "data" / "paper_embeddings.npy"
+IDS_JSON = ROOT / "data" / "paper_ids.json"
+
+if EMB_NPY.exists() and IDS_JSON.exists():
+    import json as _json
+    print("Loading cached paper embeddings from disk...")
+    _emb_matrix  = np.load(str(EMB_NPY))
+    _cached_ids  = _json.load(open(IDS_JSON, encoding="utf-8"))
+    paper_embeddings = {pid: _emb_matrix[i] for i, pid in enumerate(_cached_ids)}
+    # Fill in any papers added after the cache was built
+    _missing = [pid for pid in all_papers if pid not in paper_embeddings]
+    if _missing:
+        print(f"  Encoding {len(_missing)} papers not in cache...")
+        _texts  = [(all_papers[p]["title"] + " " + all_papers[p]["abstract"]).strip() for p in _missing]
+        _vecs   = embed_model.encode(_texts, batch_size=128, show_progress_bar=False)
+        for pid, vec in zip(_missing, _vecs):
+            paper_embeddings[pid] = vec
+else:
+    print("No embedding cache found — computing now (run scripts/precompute_embeddings.py to pre-build)...")
+    _paper_id_list = list(all_papers.keys())
+    _paper_texts = [
+        (all_papers[pid]["title"] + " " + all_papers[pid]["abstract"]).strip()
+        for pid in _paper_id_list
+    ]
+    _paper_emb_matrix = embed_model.encode(_paper_texts, batch_size=128, show_progress_bar=True)
+    paper_embeddings = {pid: emb for pid, emb in zip(_paper_id_list, _paper_emb_matrix)}
+
 metapath_graph = MetaPathBestFirstGraph(driver, embed_model, paper_embeddings)
 print(f"  {len(paper_embeddings)} paper embeddings ready")
 
@@ -180,36 +207,22 @@ def recall_at_k(ranked_ids, relevant_ids, k=5):
 # RETRIEVAL HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 def do_vector_search(query, n_papers=5):
-    """Retrieve exactly n_papers unique papers, fetching in batches until enough unique papers are found."""
-    BATCH = 500
-    query_vec = create_embedding([query])[0]
-    seen = set()
-    result = []
-    offset = 0
-    print(f"    [vector] fetching {n_papers} unique papers...", flush=True)
-    while len(result) < n_papers:
-        limit = min(BATCH, 16000 - offset)
-        if limit <= 0:
-            break
-        search_res = client.search(
-            collection_name=COLLECTION,
-            data=[query_vec],
-            limit=limit,
-            offset=offset,
-            output_fields=["paperId"],
-        )
-        hits = search_res[0]
-        if not hits:
-            break
-        for hit in hits:
-            pid = hit["entity"]["paperId"]
-            if pid not in seen:
-                seen.add(pid)
-                result.append(pid)
-                if len(result) == n_papers:
-                    break
-        offset += limit
-    print(f"    [vector] got {len(result)} unique papers", flush=True)
+    """Retrieve n_papers unique papers ranked by cosine similarity via FAISS."""
+    query_vec = create_embedding([query])[0].reshape(1, -1).astype(np.float32)
+    faiss.normalize_L2(query_vec)
+    # Search all vectors — guarantees we find n_papers unique papers
+    _, indices = _faiss_index.search(query_vec, _faiss_index.ntotal)
+    result, seen = [], set()
+    for idx in indices[0]:
+        if idx < 0:
+            continue
+        pid = _vector_pids[idx]
+        if pid not in seen:
+            seen.add(pid)
+            result.append(pid)
+            if len(result) == n_papers:
+                break
+    print(f"    [vector] {len(result)} unique papers", flush=True)
     return result
 
 def do_graph_search(seed_ids, k=50, max_hops=10):

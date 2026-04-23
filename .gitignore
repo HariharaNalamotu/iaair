@@ -3,7 +3,10 @@ __pycache__/
 *.pyc
 *.pyo
 RAG.db
+*.lock
+.venv/
 semantic_scholar_corpus/pdfs/
 .DS_Store
 .claude/
 .ipynb_checkpoints/
+ingestion/ingestion_state.json
