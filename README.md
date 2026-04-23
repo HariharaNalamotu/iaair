@@ -39,6 +39,8 @@ IAAIR/
 │
 ├── evaluation/                     # Evaluation scripts
 │   ├── run_evaluation.py           # MAIN — runs all 13 retrieval configs, outputs metrics
+│   │                               #   Disk-caches vector search, BFS, metapath, and reranker
+│   │                               #   results to results/eval_cache/ — second run is instant
 │   └── hybrid_sweep.py             # Sweeps VEC/GRAPH_K to calibrate pool sizes
 │
 ├── analysis/                       # Parameter sweep & diagnostic scripts
@@ -79,9 +81,12 @@ IAAIR/
 ├── transfer/                       # One-time transfer files (gitignored after setup)
 │   └── neo4j.dump                  # Neo4j database dump from original machine
 │
-└── results/                        # Output CSVs and plots
+└── results/                        # Output CSVs, plots, and evaluation cache
     ├── evaluation_results_summary.csv
     ├── evaluation_results_detail.csv
+    ├── eval_cache/                 # [gitignored] Disk cache for repeated eval runs
+    │                               #   Stores per-query vector, BFS, metapath, reranker results
+    │                               #   Delete this folder to force a full re-run
     └── ...
 ```
 
@@ -256,6 +261,28 @@ python /mnt/c/Users/harih/hybrid-graphrag/scripts/precompute_embeddings.py
 ```
 
 **Not stored in git** (4.6 MB — excluded because it's a derived artifact).
+
+---
+
+## Evaluation Cache
+
+`results/eval_cache/` contains pickle files that persist retrieval results between runs. On the **first run**, all 13 configs × 10 queries hit Neo4j and FAISS normally and populate the cache. On every **subsequent run**, results are loaded from disk — the evaluation completes in seconds.
+
+| What is cached | Cache key | Scope |
+|---|---|---|
+| FAISS vector search | `(query, n_papers)` | Per unique (query, pool-size) pair |
+| BFS per seed | `(seed_paper_id, k, max_hops)` | Shared across any config with the same params |
+| Meta-path BFS per seed | `(query, seed_paper_id, k, max_hops)` | Per query × seed combination |
+| CrossEncoder reranker | `(query, sorted candidate IDs, top_k)` | Per unique candidate set |
+
+Because BFS cache entries are keyed per seed (not per batch), multiple configs that share the same `k` and `max_hops` automatically reuse each other's entries.
+
+**To force a full re-run:**
+```bash
+rm -rf /mnt/c/Users/harih/hybrid-graphrag/results/eval_cache/
+```
+
+**Not stored in git** (gitignored — derived from Neo4j + FAISS state).
 
 ---
 
