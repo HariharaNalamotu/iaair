@@ -11,6 +11,9 @@ semantic_scholar_corpus/pdfs/
 .ipynb_checkpoints/
 ingestion/ingestion_state.json
 
+# Evaluation disk cache — regenerated automatically on each run
+results/eval_cache/
+
 # Large generated files — not stored in git
 data/vectors.npy
 data/vector_paperids.json

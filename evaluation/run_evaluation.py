@@ -3,7 +3,7 @@
 Evaluation pipeline using manual relevance judgments.
 Runs 4 retrieval configurations and calculates MRR@5, Recall@5.
 """
-import csv, json, os, random, time, sys
+import csv, hashlib, json, os, pickle, random, time, sys
 from dotenv import load_dotenv
 csv.field_size_limit(10 * 1024 * 1024)
 from collections import deque
@@ -30,6 +30,31 @@ FAISS_PIDS = ROOT / "data" / "vector_paperids.json"
 NEO4J_URI  = os.environ["NEO4J_URI"]
 NEO4J_USER = os.environ["NEO4J_USER"]
 NEO4J_PASS = os.environ["NEO4J_PASS"]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DISK CACHE
+# Persists vector search, graph BFS, and reranker results across runs.
+# Keyed by a hash of the function name + inputs; stored as pickle files.
+# Delete results/eval_cache/ to force a full re-run.
+# ═══════════════════════════════════════════════════════════════════════════════
+CACHE_DIR = ROOT / "results" / "eval_cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+def _cache_key(*args) -> str:
+    raw = json.dumps(args, sort_keys=True, default=str)
+    return hashlib.md5(raw.encode()).hexdigest()
+
+def _cache_get(fn: str, *args):
+    p = CACHE_DIR / f"{fn}_{_cache_key(*args)}.pkl"
+    if p.exists():
+        with open(p, "rb") as f:
+            return True, pickle.load(f)
+    return False, None
+
+def _cache_put(fn: str, value, *args) -> None:
+    p = CACHE_DIR / f"{fn}_{_cache_key(*args)}.pkl"
+    with open(p, "wb") as f:
+        pickle.dump(value, f)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOAD MODELS + CONNECT DBs
@@ -208,9 +233,12 @@ def recall_at_k(ranked_ids, relevant_ids, k=5):
 # ═══════════════════════════════════════════════════════════════════════════════
 def do_vector_search(query, n_papers=5):
     """Retrieve n_papers unique papers ranked by cosine similarity via FAISS."""
+    hit, cached = _cache_get("vec", query, n_papers)
+    if hit:
+        print(f"    [vector] {len(cached)} papers (cached)", flush=True)
+        return cached
     query_vec = create_embedding([query])[0].reshape(1, -1).astype(np.float32)
     faiss.normalize_L2(query_vec)
-    # Search all vectors — guarantees we find n_papers unique papers
     _, indices = _faiss_index.search(query_vec, _faiss_index.ntotal)
     result, seen = [], set()
     for idx in indices[0]:
@@ -222,40 +250,70 @@ def do_vector_search(query, n_papers=5):
             result.append(pid)
             if len(result) == n_papers:
                 break
+    _cache_put("vec", result, query, n_papers)
     print(f"    [vector] {len(result)} unique papers", flush=True)
+    return result
+
+def _bfs_single(sid, k, max_hops):
+    """BFS from one seed paper — cached per (seed, k, max_hops)."""
+    hit, cached = _cache_get("bfs", sid, k, max_hops)
+    if hit:
+        return cached
+    try:
+        neighbors = bfs.bfs_nearest_papers(sid, k=k, max_hops=max_hops)
+        result = [n_["paper_id"] for n_ in neighbors]
+    except Exception:
+        result = []
+    _cache_put("bfs", result, sid, k, max_hops)
     return result
 
 def do_graph_search(seed_ids, k=50, max_hops=10):
     results = {}
     n = len(seed_ids)
+    hits = 0
     for i, sid in enumerate(seed_ids):
-        print(f"\r    [graph] seed {i+1}/{n} ({100*(i+1)//n}%)", end="", flush=True)
-        try:
-            neighbors = bfs.bfs_nearest_papers(sid, k=k, max_hops=max_hops)
-            results[sid] = [n_["paper_id"] for n_ in neighbors]
-        except Exception:
-            results[sid] = []
+        neighbors = _bfs_single(sid, k, max_hops)
+        results[sid] = neighbors
+        if (CACHE_DIR / f"bfs_{_cache_key(sid, k, max_hops)}.pkl").exists():
+            hits += 1
+        print(f"\r    [graph] seed {i+1}/{n}  (cache hits: {hits})", end="", flush=True)
     print()
     return results
+
+def _metapath_single(query, sid, k, max_hops):
+    """Meta-path BFS from one seed — cached per (query, seed, k, max_hops)."""
+    hit, cached = _cache_get("meta", query, sid, k, max_hops)
+    if hit:
+        return cached
+    try:
+        neighbors = metapath_graph.retrieve(query, sid, k=k, max_hops=max_hops)
+        result = [n_["paper_id"] for n_ in neighbors]
+    except Exception:
+        result = []
+    _cache_put("meta", result, query, sid, k, max_hops)
+    return result
 
 def do_metapath_graph_search(seed_ids, query, k=15, max_hops=4):
     results = {}
     n = len(seed_ids)
+    hits = 0
     for i, sid in enumerate(seed_ids):
-        print(f"\r    [metapath] seed {i+1}/{n} ({100*(i+1)//n}%)", end="", flush=True)
-        try:
-            neighbors = metapath_graph.retrieve(query, sid, k=k, max_hops=max_hops)
-            results[sid] = [n_["paper_id"] for n_ in neighbors]
-        except Exception:
-            results[sid] = []
+        neighbors = _metapath_single(query, sid, k, max_hops)
+        results[sid] = neighbors
+        if (CACHE_DIR / f"meta_{_cache_key(query, sid, k, max_hops)}.pkl").exists():
+            hits += 1
+        print(f"\r    [metapath] seed {i+1}/{n}  (cache hits: {hits})", end="", flush=True)
     print()
     return results
 
 def do_rerank(paper_ids, query, top_k=10):
-    # Only rerank papers that are in the ground truth dataset
     candidates = [pid for pid in paper_ids if pid in ground_truth_pids]
     if not candidates:
         return []
+    hit, cached = _cache_get("rerank", query, tuple(sorted(candidates)), top_k)
+    if hit:
+        print(f"    [rerank] {len(cached)} papers (cached)", flush=True)
+        return cached
     pairs, valid_ids = [], []
     for pid in candidates:
         p = all_papers.get(pid)
@@ -267,7 +325,9 @@ def do_rerank(paper_ids, query, top_k=10):
     print(f"    [rerank] scoring {len(pairs)} ground-truth papers...", flush=True)
     scores = reranker.predict(pairs)
     scored = sorted(zip(valid_ids, scores), key=lambda x: x[1], reverse=True)
-    return [pid for pid, _ in scored[:top_k]]
+    result = [pid for pid, _ in scored[:top_k]]
+    _cache_put("rerank", result, query, tuple(sorted(candidates)), top_k)
+    return result
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 4 RETRIEVAL CONFIGURATIONS
