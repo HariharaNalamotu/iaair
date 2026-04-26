@@ -407,7 +407,7 @@ def retrieval_vector_only(query):
     gt_ranked = [pid for pid in vec_ids if pid in ground_truth_pids]
     return vec_ids, gt_ranked[:10]
 
-POOLMATCH_N = 200
+POOLMATCH_N = 225
 
 def retrieval_vector_poolmatch_reranker(query):
     vec_ids = do_vector_search(query, n_papers=POOLMATCH_N)
