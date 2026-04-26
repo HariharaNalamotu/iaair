@@ -407,18 +407,14 @@ def retrieval_vector_only(query):
     gt_ranked = [pid for pid in vec_ids if pid in ground_truth_pids]
     return vec_ids, gt_ranked[:10]
 
+POOLMATCH_N = 345
+
 def retrieval_vector_poolmatch_reranker(query):
-    # Vector-only retrieval matching the hybrid pool size
-    _, _, hybrid_pool = _do_hybrid(query)
-    n = len(hybrid_pool)
-    vec_ids = do_vector_search(query, n_papers=n)
+    vec_ids = do_vector_search(query, n_papers=POOLMATCH_N)
     return vec_ids, do_rerank(vec_ids, query, top_k=10)
 
 def retrieval_vector_poolmatch_only(query):
-    # Vector-only retrieval matching the hybrid pool size
-    _, _, hybrid_pool = _do_hybrid(query)
-    n = len(hybrid_pool)
-    vec_ids = do_vector_search(query, n_papers=n)
+    vec_ids = do_vector_search(query, n_papers=POOLMATCH_N)
     gt_ranked = [pid for pid in vec_ids if pid in ground_truth_pids]
     return vec_ids, gt_ranked[:10]
 
