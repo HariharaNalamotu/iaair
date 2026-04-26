@@ -343,9 +343,9 @@ def _unique_pool(vec_ids, graph_results):
                 all_ids.append(gid)
     return all_ids
 
-HYBRID_VEC = 60   # vector seeds for hybrid (deduped pool ~300)
+HYBRID_VEC = 60   # vector seeds for hybrid (deduped pool ~200)
 VECTOR_VEC = HYBRID_VEC  # vector pool size matches hybrid's vector component
-GRAPH_K    = 15   # graph neighbors per seed paper
+GRAPH_K    = 9    # BFS neighbors per seed — tuned to ~200 deduped
 
 from collections import Counter
 
@@ -407,7 +407,7 @@ def retrieval_vector_only(query):
     gt_ranked = [pid for pid in vec_ids if pid in ground_truth_pids]
     return vec_ids, gt_ranked[:10]
 
-POOLMATCH_N = 345
+POOLMATCH_N = 200
 
 def retrieval_vector_poolmatch_reranker(query):
     vec_ids = do_vector_search(query, n_papers=POOLMATCH_N)
@@ -421,8 +421,8 @@ def retrieval_vector_poolmatch_only(query):
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONSTANT-BUDGET HYBRID (budget ~800 pre-dedup: VEC=60, GRAPH_K=12 -> 60*13=780)
 # ═══════════════════════════════════════════════════════════════════════════════
-BUDGET_VEC   = 80
-BUDGET_GK    = 14   # 80 + 80*14 = 1200 pre-dedup retrievals
+BUDGET_VEC   = 60
+BUDGET_GK    = 9    # 60 + 60*9 = 600 pre-dedup → ~200 deduped
 
 def _do_budget_hybrid(query):
     vec_ids = do_vector_search(query, n_papers=BUDGET_VEC)
@@ -473,8 +473,8 @@ def retrieval_budget800_hybrid_interleave(query):
 # ═══════════════════════════════════════════════════════════════════════════════
 # QUERY-AWARE META-PATH HYBRID (VEC=60, GRAPH_K=15 to match regular hybrid)
 # ═══════════════════════════════════════════════════════════════════════════════
-METAPATH_VEC = 300   # pool = vector seeds ∪ graph; VEC=300 guarantees ≥300 deduped
-METAPATH_GK  = 20   # graph adds a small number of unique papers on top
+METAPATH_VEC = 200   # pool = vector seeds ∪ graph; VEC=200 guarantees ≥200 deduped
+METAPATH_GK  = 5    # small GK keeps pool close to 200 (metapath has very high overlap)
 
 def _do_metapath_hybrid(query):
     vec_ids = do_vector_search(query, n_papers=METAPATH_VEC)
