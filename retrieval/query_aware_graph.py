@@ -65,7 +65,7 @@ class MetaPathBestFirstGraph:
     def _get_meta_neighbors(self, session, paper_id):
         return [r["id"] for r in session.run(self.CANDIDATE_QUERY, id=paper_id)]
 
-    def retrieve(self, query, seed_paper_id, k, max_hops=4):
+    def retrieve(self, query, seed_paper_id, k, max_hops=4, sim_threshold=0.0):
         query_vec = self.embed_model.encode([query])[0]
         frontier = []
         counter = 0
@@ -82,6 +82,8 @@ class MetaPathBestFirstGraph:
 
             while frontier and len(found) < k:
                 neg_sim, _, pid, depth = heapq.heappop(frontier)
+                if -neg_sim < sim_threshold:   # heap is max-by-sim; all remaining are worse
+                    break
                 found.append({
                     "paper_id": pid,
                     "distance": depth,

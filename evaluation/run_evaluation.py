@@ -4,6 +4,7 @@ Evaluation pipeline using manual relevance judgments.
 Runs 4 retrieval configurations and calculates MRR@5, Recall@5.
 """
 import csv, hashlib, json, os, pickle, random, time, sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 csv.field_size_limit(10 * 1024 * 1024)
 from collections import deque
@@ -25,11 +26,12 @@ from query_aware_graph import MetaPathBestFirstGraph
 # ═══════════════════════════════════════════════════════════════════════════════
 load_dotenv(ROOT / ".env")
 
-FAISS_VECS = ROOT / "data" / "vectors.npy"
-FAISS_PIDS = ROOT / "data" / "vector_paperids.json"
-NEO4J_URI  = os.environ["NEO4J_URI"]
-NEO4J_USER = os.environ["NEO4J_USER"]
-NEO4J_PASS = os.environ["NEO4J_PASS"]
+FAISS_VECS   = ROOT / "data" / "vectors.npy"
+FAISS_PIDS   = ROOT / "data" / "vector_paperids.json"
+NEO4J_URI    = os.environ["NEO4J_URI"]
+NEO4J_USER   = os.environ["NEO4J_USER"]
+NEO4J_PASS   = os.environ["NEO4J_PASS"]
+GRAPH_WORKERS = min(32, os.cpu_count() or 8)   # parallel Neo4j threads (Ultra 9 275HX)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DISK CACHE
@@ -60,8 +62,10 @@ def _cache_put(fn: str, value, *args) -> None:
 # LOAD MODELS + CONNECT DBs
 # ═══════════════════════════════════════════════════════════════════════════════
 print("Loading models...")
-embed_model = SentenceTransformer("jordyvl/scibert_scivocab_uncased_sentence_transformer")
-reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+embed_model = SentenceTransformer(
+    "jordyvl/scibert_scivocab_uncased_sentence_transformer", device="cuda"
+)
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device="cuda")
 def create_embedding(texts):
     return embed_model.encode(texts)
 
@@ -270,13 +274,14 @@ def _bfs_single(sid, k, max_hops):
 def do_graph_search(seed_ids, k=50, max_hops=10):
     results = {}
     n = len(seed_ids)
-    hits = 0
-    for i, sid in enumerate(seed_ids):
-        neighbors = _bfs_single(sid, k, max_hops)
-        results[sid] = neighbors
-        if (CACHE_DIR / f"bfs_{_cache_key(sid, k, max_hops)}.pkl").exists():
-            hits += 1
-        print(f"\r    [graph] seed {i+1}/{n}  (cache hits: {hits})", end="", flush=True)
+    completed = 0
+    with ThreadPoolExecutor(max_workers=GRAPH_WORKERS) as ex:
+        futures = {ex.submit(_bfs_single, sid, k, max_hops): sid for sid in seed_ids}
+        for fut in as_completed(futures):
+            sid = futures[fut]
+            results[sid] = fut.result()
+            completed += 1
+            print(f"\r    [graph] {completed}/{n}", end="", flush=True)
     print()
     return results
 
@@ -296,13 +301,15 @@ def _metapath_single(query, sid, k, max_hops):
 def do_metapath_graph_search(seed_ids, query, k=15, max_hops=4):
     results = {}
     n = len(seed_ids)
-    hits = 0
-    for i, sid in enumerate(seed_ids):
-        neighbors = _metapath_single(query, sid, k, max_hops)
-        results[sid] = neighbors
-        if (CACHE_DIR / f"meta_{_cache_key(query, sid, k, max_hops)}.pkl").exists():
-            hits += 1
-        print(f"\r    [metapath] seed {i+1}/{n}  (cache hits: {hits})", end="", flush=True)
+    completed = 0
+    with ThreadPoolExecutor(max_workers=GRAPH_WORKERS) as ex:
+        futures = {ex.submit(_metapath_single, query, sid, k, max_hops): sid
+                   for sid in seed_ids}
+        for fut in as_completed(futures):
+            sid = futures[fut]
+            results[sid] = fut.result()
+            completed += 1
+            print(f"\r    [metapath] {completed}/{n}", end="", flush=True)
     print()
     return results
 
@@ -523,6 +530,249 @@ def retrieval_metapath_hybrid_interleave(query):
     return all_ids, gt_ordered[:10]
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# IDEA 2 — SHALLOW HOP DEPTH (max_hops = 1 or 2)
+# ═══════════════════════════════════════════════════════════════════════════════
+METAPATH_HOPS_DEFAULT = 4
+METAPATH_HOPS_SHALLOW = 2
+METAPATH_HOPS_DIRECT  = 1
+
+def _do_metapath_hybrid_hops(query, max_hops):
+    vec_ids = do_vector_search(query, n_papers=METAPATH_VEC)
+    graph_results = do_metapath_graph_search(vec_ids, query, k=METAPATH_GK,
+                                             max_hops=max_hops)
+    return vec_ids, graph_results, _unique_pool(vec_ids, graph_results)
+
+def _metapath_freq_rank(vec_ids, graph_results, all_ids):
+    freq = Counter()
+    for pid in vec_ids:
+        freq[pid] += 1
+    for sid, neighbors in graph_results.items():
+        for pid in neighbors:
+            freq[pid] += 1
+    vec_rank = {pid: i for i, pid in enumerate(vec_ids)}
+    gt_candidates = [pid for pid in freq if pid in ground_truth_pids]
+    return sorted(gt_candidates,
+                  key=lambda pid: (-freq[pid], vec_rank.get(pid, float('inf'))))[:10]
+
+def _metapath_interleave_rank(vec_ids, graph_results):
+    seen, ordered = set(), []
+    for vid in vec_ids:
+        if vid not in seen:
+            seen.add(vid); ordered.append(vid)
+    max_len = max((len(v) for v in graph_results.values()), default=0)
+    for round_idx in range(max_len):
+        for vid in vec_ids:
+            neighbors = graph_results.get(vid, [])
+            if round_idx < len(neighbors):
+                gid = neighbors[round_idx]
+                if gid not in seen:
+                    seen.add(gid); ordered.append(gid)
+    return [pid for pid in ordered if pid in ground_truth_pids][:10]
+
+def retrieval_metapath_hop2_reranker(query):
+    _, _, all_ids = _do_metapath_hybrid_hops(query, METAPATH_HOPS_SHALLOW)
+    return all_ids, do_rerank(all_ids, query, top_k=10)
+
+def retrieval_metapath_hop2_freq(query):
+    vec_ids, graph_results, all_ids = _do_metapath_hybrid_hops(query, METAPATH_HOPS_SHALLOW)
+    return all_ids, _metapath_freq_rank(vec_ids, graph_results, all_ids)
+
+def retrieval_metapath_hop2_interleave(query):
+    vec_ids, graph_results, all_ids = _do_metapath_hybrid_hops(query, METAPATH_HOPS_SHALLOW)
+    return all_ids, _metapath_interleave_rank(vec_ids, graph_results)
+
+def retrieval_metapath_hop1_reranker(query):
+    _, _, all_ids = _do_metapath_hybrid_hops(query, METAPATH_HOPS_DIRECT)
+    return all_ids, do_rerank(all_ids, query, top_k=10)
+
+def retrieval_metapath_hop1_freq(query):
+    vec_ids, graph_results, all_ids = _do_metapath_hybrid_hops(query, METAPATH_HOPS_DIRECT)
+    return all_ids, _metapath_freq_rank(vec_ids, graph_results, all_ids)
+
+def retrieval_metapath_hop1_interleave(query):
+    vec_ids, graph_results, all_ids = _do_metapath_hybrid_hops(query, METAPATH_HOPS_DIRECT)
+    return all_ids, _metapath_interleave_rank(vec_ids, graph_results)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# IDEA 1 — SEMANTIC SIMILARITY THRESHOLD
+# ═══════════════════════════════════════════════════════════════════════════════
+METAPATH_SIM_THRESH = 0.3   # cosine similarity cutoff; ablate over [0.2, 0.3, 0.4]
+
+def _metapath_single_thresh(query, sid, k, max_hops, sim_threshold):
+    hit, cached = _cache_get("meta_thresh", query, sid, k, max_hops, sim_threshold)
+    if hit:
+        return cached
+    try:
+        neighbors = metapath_graph.retrieve(query, sid, k=k, max_hops=max_hops,
+                                            sim_threshold=sim_threshold)
+        result = [n_["paper_id"] for n_ in neighbors]
+    except Exception:
+        result = []
+    _cache_put("meta_thresh", result, query, sid, k, max_hops, sim_threshold)
+    return result
+
+def _do_metapath_hybrid_thresh(query):
+    vec_ids = do_vector_search(query, n_papers=METAPATH_VEC)
+    graph_results = {}
+    n = len(vec_ids)
+    completed = 0
+    with ThreadPoolExecutor(max_workers=GRAPH_WORKERS) as ex:
+        futures = {
+            ex.submit(_metapath_single_thresh, query, sid, METAPATH_GK, 4,
+                      METAPATH_SIM_THRESH): sid
+            for sid in vec_ids
+        }
+        for fut in as_completed(futures):
+            sid = futures[fut]
+            graph_results[sid] = fut.result()
+            completed += 1
+            print(f"\r    [metapath-thresh] {completed}/{n}", end="", flush=True)
+    print()
+    all_ids = _unique_pool(vec_ids, graph_results)
+    return vec_ids, graph_results, all_ids
+
+def retrieval_metapath_thresh_reranker(query):
+    _, _, all_ids = _do_metapath_hybrid_thresh(query)
+    return all_ids, do_rerank(all_ids, query, top_k=10)
+
+def retrieval_metapath_thresh_freq(query):
+    vec_ids, graph_results, all_ids = _do_metapath_hybrid_thresh(query)
+    return all_ids, _metapath_freq_rank(vec_ids, graph_results, all_ids)
+
+def retrieval_metapath_thresh_interleave(query):
+    vec_ids, graph_results, all_ids = _do_metapath_hybrid_thresh(query)
+    return all_ids, _metapath_interleave_rank(vec_ids, graph_results)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# IDEA 3 — WEIGHTED HYBRID RANKING (α·vec + β·graph + γ·reranker)
+# ═══════════════════════════════════════════════════════════════════════════════
+WEIGHT_ALPHA = 0.4   # vector similarity
+WEIGHT_BETA  = 0.2   # graph (metapath) cosine similarity
+WEIGHT_GAMMA = 0.4   # CrossEncoder reranker score
+
+def do_vector_search_with_scores(query, n_papers=5):
+    hit, cached = _cache_get("vec_scores", query, n_papers)
+    if hit:
+        ids, scores = cached
+        print(f"    [vector+scores] {len(ids)} papers (cached)", flush=True)
+        return ids, scores
+    query_vec = create_embedding([query])[0].reshape(1, -1).astype(np.float32)
+    faiss.normalize_L2(query_vec)
+    distances, indices = _faiss_index.search(query_vec, _faiss_index.ntotal)
+    result_ids, score_map, seen = [], {}, set()
+    for raw_idx, dist in zip(indices[0], distances[0]):
+        if raw_idx < 0:
+            continue
+        pid = _vector_pids[raw_idx]
+        if pid not in seen:
+            seen.add(pid)
+            result_ids.append(pid)
+            score_map[pid] = float(dist)
+            if len(result_ids) == n_papers:
+                break
+    _cache_put("vec_scores", (result_ids, score_map), query, n_papers)
+    print(f"    [vector+scores] {len(result_ids)} unique papers", flush=True)
+    return result_ids, score_map
+
+def _metapath_single_with_scores(query, sid, k, max_hops):
+    hit, cached = _cache_get("meta_scores", query, sid, k, max_hops)
+    if hit:
+        return cached
+    try:
+        neighbors = metapath_graph.retrieve(query, sid, k=k, max_hops=max_hops)
+        result_ids = [n_["paper_id"] for n_ in neighbors]
+        score_map  = {n_["paper_id"]: n_["similarity"] for n_ in neighbors}
+    except Exception:
+        result_ids, score_map = [], {}
+    _cache_put("meta_scores", (result_ids, score_map), query, sid, k, max_hops)
+    return result_ids, score_map
+
+def do_rerank_with_scores(paper_ids, query, top_k=10):
+    candidates = [pid for pid in paper_ids if pid in ground_truth_pids]
+    if not candidates:
+        return [], {}
+    hit, cached = _cache_get("rerank_scores", query, tuple(sorted(candidates)), top_k)
+    if hit:
+        ids, scores = cached
+        print(f"    [rerank+scores] {len(ids)} papers (cached)", flush=True)
+        return ids, scores
+    pairs, valid_ids = [], []
+    for pid in candidates:
+        p = all_papers.get(pid)
+        if p:
+            pairs.append((query, (p["title"] + " " + p["abstract"]).strip()))
+            valid_ids.append(pid)
+    if not pairs:
+        return [], {}
+    print(f"    [rerank+scores] scoring {len(pairs)} ground-truth papers...", flush=True)
+    raw_scores = reranker.predict(pairs)
+    scored     = sorted(zip(valid_ids, raw_scores), key=lambda x: x[1], reverse=True)
+    result_ids = [pid for pid, _ in scored[:top_k]]
+    score_map  = {pid: float(sc) for pid, sc in scored}
+    _cache_put("rerank_scores", (result_ids, score_map),
+               query, tuple(sorted(candidates)), top_k)
+    return result_ids, score_map
+
+def _aggregate_graph_scores(seed_score_maps):
+    aggregated = {}
+    for score_map in seed_score_maps.values():
+        for pid, sim in score_map.items():
+            if pid not in aggregated or sim > aggregated[pid]:
+                aggregated[pid] = sim
+    return aggregated
+
+def _weighted_rank(candidates, vec_scores, graph_scores, rerank_scores,
+                   alpha=WEIGHT_ALPHA, beta=WEIGHT_BETA, gamma=WEIGHT_GAMMA,
+                   top_k=10):
+    gt_candidates = [pid for pid in candidates if pid in ground_truth_pids]
+    if not gt_candidates:
+        return []
+
+    def _minmax(raw, ids):
+        present = [raw[pid] for pid in ids if pid in raw]
+        if not present:
+            return {pid: 0.0 for pid in ids}
+        lo, hi = min(present), max(present)
+        span = hi - lo if hi != lo else 1.0
+        return {pid: (raw[pid] - lo) / span if pid in raw else 0.0 for pid in ids}
+
+    nv = _minmax(vec_scores,    gt_candidates)
+    ng = _minmax(graph_scores,  gt_candidates)
+    nr = _minmax(rerank_scores, gt_candidates)
+    combined = {pid: alpha * nv[pid] + beta * ng[pid] + gamma * nr[pid]
+                for pid in gt_candidates}
+    return sorted(gt_candidates, key=lambda p: combined[p], reverse=True)[:top_k]
+
+def _do_metapath_hybrid_weighted(query):
+    vec_ids, vec_scores = do_vector_search_with_scores(query, n_papers=METAPATH_VEC)
+    seed_score_maps = {}
+    graph_results   = {}
+    n = len(vec_ids)
+    completed = 0
+    with ThreadPoolExecutor(max_workers=GRAPH_WORKERS) as ex:
+        futures = {
+            ex.submit(_metapath_single_with_scores, query, sid, METAPATH_GK, 4): sid
+            for sid in vec_ids
+        }
+        for fut in as_completed(futures):
+            sid = futures[fut]
+            ids, score_map = fut.result()
+            graph_results[sid]   = ids
+            seed_score_maps[sid] = score_map
+            completed += 1
+            print(f"\r    [metapath-weighted] {completed}/{n}", end="", flush=True)
+    print()
+    graph_scores = _aggregate_graph_scores(seed_score_maps)
+    all_ids      = _unique_pool(vec_ids, graph_results)
+    return vec_ids, graph_scores, all_ids, vec_scores
+
+def retrieval_metapath_weighted(query):
+    vec_ids, graph_scores, all_ids, vec_scores = _do_metapath_hybrid_weighted(query)
+    _, rerank_scores = do_rerank_with_scores(all_ids, query, top_k=10)
+    ranked = _weighted_rank(all_ids, vec_scores, graph_scores, rerank_scores)
+    return all_ids, ranked
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # RUN EXPERIMENTS
 # ═══════════════════════════════════════════════════════════════════════════════
 print("\n" + "="*70)
@@ -547,6 +797,19 @@ configs = [
     ("vector_only",                  retrieval_vector_only,                  ["MRR@5", "Recall@5"]),
     ("vector_poolmatch_reranker",    retrieval_vector_poolmatch_reranker,    ["MRR@5", "Recall@5"]),
     ("vector_poolmatch_only",        retrieval_vector_poolmatch_only,        ["MRR@5", "Recall@5"]),
+    # --- Idea 2: shallow hop depth ---
+    ("metapath_hop2_reranker",       retrieval_metapath_hop2_reranker,       ["MRR@5", "Recall@5"]),
+    ("metapath_hop2_freq",           retrieval_metapath_hop2_freq,           ["MRR@5", "Recall@5"]),
+    ("metapath_hop2_interleave",     retrieval_metapath_hop2_interleave,     ["MRR@5", "Recall@5"]),
+    ("metapath_hop1_reranker",       retrieval_metapath_hop1_reranker,       ["MRR@5", "Recall@5"]),
+    ("metapath_hop1_freq",           retrieval_metapath_hop1_freq,           ["MRR@5", "Recall@5"]),
+    ("metapath_hop1_interleave",     retrieval_metapath_hop1_interleave,     ["MRR@5", "Recall@5"]),
+    # --- Idea 1: similarity threshold filter ---
+    ("metapath_thresh_reranker",     retrieval_metapath_thresh_reranker,     ["MRR@5", "Recall@5"]),
+    ("metapath_thresh_freq",         retrieval_metapath_thresh_freq,         ["MRR@5", "Recall@5"]),
+    ("metapath_thresh_interleave",   retrieval_metapath_thresh_interleave,   ["MRR@5", "Recall@5"]),
+    # --- Idea 3: weighted hybrid ranking (alpha*vec + beta*graph + gamma*reranker) ---
+    ("metapath_weighted",            retrieval_metapath_weighted,            ["MRR@5", "Recall@5"]),
 ]
 
 all_results = {}
