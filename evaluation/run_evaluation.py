@@ -3,7 +3,7 @@
 Evaluation pipeline using manual relevance judgments.
 Runs 4 retrieval configurations and calculates MRR@5, Recall@5.
 """
-import csv, hashlib, json, os, pickle, random, time, sys
+import argparse, csv, hashlib, json, os, pickle, random, time, sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 csv.field_size_limit(10 * 1024 * 1024)
@@ -11,6 +11,8 @@ from collections import deque
 
 import numpy as np
 import faiss
+import torch
+import torch.nn as nn
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from neo4j import GraphDatabase
 
@@ -68,6 +70,38 @@ embed_model = SentenceTransformer(
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device="cuda")
 def create_embedding(texts):
     return embed_model.encode(texts)
+
+# ── Neural-network ranker (loaded from results/ranker_model.pt if present) ───
+class RelevanceNN(nn.Module):
+    """3 → 16 → 8 → 1  (ReLU hidden layers, Sigmoid output)."""
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(3, 16), nn.ReLU(),
+            nn.Linear(16, 8), nn.ReLU(),
+            nn.Linear(8, 1),  nn.Sigmoid(),
+        )
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+_nn_model      = None
+_nn_feat_min   = None
+_nn_feat_range = None
+
+_nn_model_path  = ROOT / "results" / "ranker_model.pt"
+_nn_scaler_path = ROOT / "results" / "ranker_scaler.json"
+
+if _nn_model_path.exists() and _nn_scaler_path.exists():
+    _sc = json.load(open(_nn_scaler_path))
+    _nn_feat_min   = np.array(_sc["min"], dtype=np.float32)
+    _nn_feat_range = np.array(_sc["max"], dtype=np.float32) - _nn_feat_min
+    _nn_feat_range = np.where(_nn_feat_range > 0, _nn_feat_range, 1.0)
+    _nn_model = RelevanceNN()
+    _nn_model.load_state_dict(torch.load(_nn_model_path, map_location="cuda"))
+    _nn_model = _nn_model.to("cuda").eval()
+    print("  Loaded NN ranker (ranker_model.pt)")
+else:
+    print("  No NN ranker found — train with scripts/train_ranker.py")
 
 print("Loading FAISS index...")
 if not FAISS_VECS.exists() or not FAISS_PIDS.exists():
@@ -772,6 +806,32 @@ def retrieval_metapath_weighted(query):
     ranked = _weighted_rank(all_ids, vec_scores, graph_scores, rerank_scores)
     return all_ids, ranked
 
+def retrieval_metapath_nn(query):
+    """Rank ground-truth papers using the trained RelevanceNN model."""
+    if _nn_model is None:
+        sys.exit("No NN model found. Run: python scripts/train_ranker.py")
+    vec_ids, graph_scores, all_ids, vec_scores = _do_metapath_hybrid_weighted(query)
+    _, rerank_scores = do_rerank_with_scores(all_ids, query, top_k=10)
+
+    gt_candidates = [pid for pid in all_ids if pid in ground_truth_pids]
+    if not gt_candidates:
+        return all_ids, []
+
+    feats = np.array([[
+        vec_scores.get(pid,    0.0),
+        graph_scores.get(pid,  0.0),
+        rerank_scores.get(pid, 0.0),
+    ] for pid in gt_candidates], dtype=np.float32)
+
+    feats_scaled = np.clip((feats - _nn_feat_min) / _nn_feat_range, 0.0, 1.0)
+    with torch.no_grad():
+        scores = _nn_model(
+            torch.tensor(feats_scaled, device="cuda")
+        ).cpu().numpy()
+
+    ranked = [gt_candidates[i] for i in np.argsort(scores)[::-1]][:10]
+    return all_ids, ranked
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # RUN EXPERIMENTS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -810,7 +870,22 @@ configs = [
     ("metapath_thresh_interleave",   retrieval_metapath_thresh_interleave,   ["MRR@5", "Recall@5"]),
     # --- Idea 3: weighted hybrid ranking (alpha*vec + beta*graph + gamma*reranker) ---
     ("metapath_weighted",            retrieval_metapath_weighted,            ["MRR@5", "Recall@5"]),
+    # --- Neural network ranker (trained with scripts/train_ranker.py) ---
+    ("metapath_nn",                  retrieval_metapath_nn,                  ["MRR@5", "Recall@5"]),
 ]
+
+# ── Optional: run only one config  python run_evaluation.py --only metapath_nn
+_parser = argparse.ArgumentParser()
+_parser.add_argument("--only", default=None,
+                     help="Run a single config by name instead of all configs")
+_cli, _ = _parser.parse_known_args()
+if _cli.only:
+    configs = [(n, fn, m) for n, fn, m in configs if n == _cli.only]
+    if not configs:
+        sys.exit(f"Unknown config '{_cli.only}'. "
+                 f"Available: {[c[0] for c in configs]}")
+    print(f"Running single config: {_cli.only}")
+
 
 all_results = {}
 pool_sizes = {}  # config -> list of pool sizes per query
