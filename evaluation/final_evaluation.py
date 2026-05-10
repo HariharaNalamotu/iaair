@@ -106,13 +106,15 @@ with tqdm(total=3, desc="FAISS → GPU", unit="step", ncols=80) as pb:
     faiss.normalize_L2(_raw_vecs)
     _faiss_cpu = faiss.IndexFlatIP(_raw_vecs.shape[1])
     _faiss_cpu.add(_raw_vecs); pb.update(1)
-    if DEVICE == "cuda":
+    try:
         _gpu_res   = faiss.StandardGpuResources()
         _faiss_idx = faiss.index_cpu_to_gpu(_gpu_res, 0, _faiss_cpu)
-    else:
-        _faiss_idx = _faiss_cpu
+        _faiss_loc = "GPU VRAM"
+    except AttributeError:
+        _faiss_idx = _faiss_cpu   # faiss-cpu installed; GPU transfer not available
+        _faiss_loc = "RAM (faiss-cpu)"
     pb.update(1)
-_log(f"  FAISS: {_faiss_idx.ntotal} vectors in {'GPU VRAM' if DEVICE=='cuda' else 'RAM'}")
+_log(f"  FAISS: {_faiss_idx.ntotal} vectors in {_faiss_loc}")
 
 # ── Neo4j ─────────────────────────────────────────────────────────────────────
 driver = GraphDatabase.driver(
