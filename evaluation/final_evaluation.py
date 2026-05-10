@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
 """
-Final evaluation sweep: all configs × 11 pool-size budgets × VEC sweep.
+Final evaluation sweep — optimised for Ultra 9 275HX + RTX 5080 Mobile + 32 GB RAM.
 
-Budgets : 100, 125, 150, ..., 350  (step 25)
-VEC     : 1, 25, 50, ..., budget   (step 25, always include 1 and budget)
-GRAPH_K : auto-tuned per (budget, VEC, retrieval_type) via binary search
-          so the average deduped pool lands within 5 % of the target budget.
-          If binary search bounces (can't converge), GRAPH_K is set to the
-          smallest value that puts the pool just above the 5 % threshold.
+Hardware utilisation:
+  GPU  — FAISS index lives in VRAM; all queries batch-searched in one GPU pass
+          at startup, eliminating per-call GPU latency.
+          SciBERT and CrossEncoder run on CUDA; CrossEncoder batches all 10
+          queries in a single inference call per (budget, VEC) point.
+  CPU  — 64-thread pool for concurrent Neo4j BFS/metapath queries (I/O-bound,
+          so thread count >> core count is correct). Neo4j connection pool = 100.
+  RAM  — Full disk cache loaded into memory at startup so every cache read is a
+          pure dict lookup; no disk I/O on subsequent runs.
 
-Configs at each (budget, VEC, GRAPH_K):
-    bfs       × reranker / freq / interleave
-    metapath  × reranker / freq / interleave
-    vector    × reranker / none               (VEC = budget, GRAPH_K = 0)
+Sweep:
+  Budgets : 100, 125, 150, ..., 350  (step 25)
+  VEC     : 1, 25, 50, ..., budget   (step 25, always include 1 and budget)
+  GRAPH_K : auto-tuned per (budget, VEC, type) via binary search ±5 %
+  Configs : bfs × {reranker, freq, interleave}
+            metapath × {reranker, freq, interleave}
+            vector   × {reranker, none}  (only at VEC = budget)
 
-Results saved incrementally to results/final_evaluation_sweep.csv.
+Output  : results/final_evaluation_sweep.csv  (incremental, resumable)
 
 Run:
     conda activate torchtest
     python /mnt/c/Users/harih/hybrid-graphrag/evaluation/final_evaluation.py
 """
 
-import csv, hashlib, json, os, pathlib, pickle, sys, time, warnings
+import csv, hashlib, json, os, pathlib, pickle, signal, sys, time, warnings
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -42,23 +48,26 @@ from query_aware_graph import MetaPathBestFirstGraph
 
 load_dotenv(ROOT / ".env")
 
-CACHE_DIR   = ROOT / "results" / "eval_cache"
-SWEEP_CSV   = ROOT / "results" / "final_evaluation_sweep.csv"
+CACHE_DIR  = ROOT / "results" / "eval_cache"
+SWEEP_CSV  = ROOT / "results" / "final_evaluation_sweep.csv"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-NEO4J_URI   = os.environ["NEO4J_URI"]
-NEO4J_USER  = os.environ["NEO4J_USER"]
-NEO4J_PASS  = os.environ["NEO4J_PASS"]
-DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
-WORKERS     = min(32, os.cpu_count() or 8)
+NEO4J_URI  = os.environ["NEO4J_URI"]
+NEO4J_USER = os.environ["NEO4J_USER"]
+NEO4J_PASS = os.environ["NEO4J_PASS"]
 
-# ── Sweep parameters ──────────────────────────────────────────────────────────
-BUDGETS      = list(range(100, 351, 25))          # [100, 125, ..., 350]
-TUNE_QUERIES = 3      # queries sampled for GRAPH_K tuning (first N)
-TOLERANCE    = 0.05   # ± 5 % of target budget
-MAX_GK       = 200    # hard cap on GRAPH_K search
-BFS_HOPS     = 10
-META_HOPS    = 4
+# ── Hardware config ───────────────────────────────────────────────────────────
+DEVICE   = "cuda" if torch.cuda.is_available() else "cpu"
+WORKERS  = 64          # I/O-bound Neo4j threads; far exceeds core count
+NEO4J_POOL = 100       # Neo4j bolt connection pool
+
+# ── Sweep params ──────────────────────────────────────────────────────────────
+BUDGETS     = list(range(100, 351, 25))
+TOLERANCE   = 0.05
+MAX_GK      = 200
+BFS_HOPS    = 10
+META_HOPS   = 4
+TUNE_N      = 3        # queries sampled for GRAPH_K tuning
 
 QUERIES = [
     "How do graph-based and multi-step retrieval methods enhance retrieval-augmented generation systems?",
@@ -72,26 +81,55 @@ QUERIES = [
     "What benchmarks, evaluation methods, and datasets are used to assess RAG and information retrieval system performance?",
     "How can AI systems assist in peer review, quality assessment, and research impact evaluation of scholarly work?",
 ]
+NQ = len(QUERIES)
 
-# ── Startup ───────────────────────────────────────────────────────────────────
-print("Loading models...")
-embed_model = SentenceTransformer(
+# ── Graceful Ctrl-C ───────────────────────────────────────────────────────────
+_shutdown = False
+def _handle_sigint(sig, frame):
+    global _shutdown
+    print("\n[Interrupted] Finishing current point then saving…")
+    _shutdown = True
+signal.signal(signal.SIGINT, _handle_sigint)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# STARTUP: load everything into memory / GPU
+# ═════════════════════════════════════════════════════════════════════════════
+t0 = time.time()
+
+print(f"Device : {DEVICE}" +
+      (f"  ({torch.cuda.get_device_name(0)})" if DEVICE == "cuda" else ""))
+print(f"Workers: {WORKERS}  Neo4j pool: {NEO4J_POOL}")
+
+# ── Models ────────────────────────────────────────────────────────────────────
+print("Loading SciBERT + CrossEncoder on GPU…")
+embed_model    = SentenceTransformer(
     "jordyvl/scibert_scivocab_uncased_sentence_transformer", device=DEVICE
 )
 reranker_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device=DEVICE)
 
-print("Loading FAISS index...")
+# ── FAISS — move to GPU VRAM ──────────────────────────────────────────────────
+print("Loading FAISS index → GPU…")
 _raw_vecs    = np.load(str(ROOT / "data" / "vectors.npy"))
 _vector_pids = json.load(open(ROOT / "data" / "vector_paperids.json"))
 faiss.normalize_L2(_raw_vecs)
-_faiss_index = faiss.IndexFlatIP(_raw_vecs.shape[1])
-_faiss_index.add(_raw_vecs)
-print(f"  {_faiss_index.ntotal} vectors")
+_faiss_cpu = faiss.IndexFlatIP(_raw_vecs.shape[1])
+_faiss_cpu.add(_raw_vecs)
+if DEVICE == "cuda":
+    _gpu_res  = faiss.StandardGpuResources()
+    _faiss_idx = faiss.index_cpu_to_gpu(_gpu_res, 0, _faiss_cpu)
+else:
+    _faiss_idx = _faiss_cpu
+print(f"  {_faiss_idx.ntotal} vectors in {'GPU VRAM' if DEVICE=='cuda' else 'RAM'}")
 
-print("Connecting to Neo4j...")
-driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+# ── Neo4j ─────────────────────────────────────────────────────────────────────
+print("Connecting to Neo4j…")
+driver = GraphDatabase.driver(
+    NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS),
+    max_connection_pool_size=NEO4J_POOL,
+)
 
-print("Loading paper data...")
+# ── Paper data ────────────────────────────────────────────────────────────────
+print("Loading paper data…")
 all_papers: dict[str, dict] = {}
 with open(ROOT / "data" / "papers.csv", encoding="utf-8") as f:
     for row in csv.DictReader(f):
@@ -102,13 +140,13 @@ with open(ROOT / "data" / "papers.csv", encoding="utf-8") as f:
                 "abstract": row.get("abstract", ""),
             }
 
-print("Loading paper embeddings...")
 _emb_matrix = np.load(str(ROOT / "data" / "paper_embeddings.npy"))
 _emb_ids    = json.load(open(ROOT / "data" / "paper_ids.json"))
 paper_embeddings = {pid: _emb_matrix[i] for i, pid in enumerate(_emb_ids)}
 metapath_graph   = MetaPathBestFirstGraph(driver, embed_model, paper_embeddings)
 
-print("Loading ground truth...")
+# ── Ground truth ──────────────────────────────────────────────────────────────
+print("Loading ground truth…")
 relevance_by_query: dict[int, set] = {}
 ground_truth_pids:  set[str]       = set()
 with open(ROOT / "data" / "ground_truth_relevance.csv", encoding="utf-8") as f:
@@ -119,61 +157,103 @@ with open(ROOT / "data" / "ground_truth_relevance.csv", encoding="utf-8") as f:
         if int(row["relevant"]) == 1:
             relevance_by_query[qi].add(row["paperId"])
 
-print(f"Ready — {len(all_papers)} papers, {len(ground_truth_pids)} ground-truth papers\n")
+# ─────────────────────────────────────────────────────────────────────────────
+# In-memory cache (write-through; load entire disk cache at startup)
+# ─────────────────────────────────────────────────────────────────────────────
+_mem: dict[str, object] = {}
 
-# ── Cache helpers ─────────────────────────────────────────────────────────────
+print("Loading disk cache into RAM…")
+n_loaded = 0
+for p in CACHE_DIR.glob("*.pkl"):
+    try:
+        _mem[p.stem] = pickle.load(open(p, "rb"))
+        n_loaded += 1
+    except Exception:
+        pass
+print(f"  {n_loaded} entries loaded ({n_loaded*1e-3:.1f}k)")
+
 def _ckey(*args) -> str:
     return hashlib.md5(json.dumps(args, sort_keys=True, default=str).encode()).hexdigest()
 
-def _cget(ns, *args):
-    p = CACHE_DIR / f"{ns}_{_ckey(*args)}.pkl"
-    return (True, pickle.load(open(p, "rb"))) if p.exists() else (False, None)
+def _cget(ns: str, *args):
+    k = f"{ns}_{_ckey(*args)}"
+    v = _mem.get(k)
+    return (True, v) if v is not None else (False, None)
 
-def _cput(ns, val, *args):
-    with open(CACHE_DIR / f"{ns}_{_ckey(*args)}.pkl", "wb") as f:
+def _cput(ns: str, val, *args):
+    k = f"{ns}_{_ckey(*args)}"
+    _mem[k] = val
+    with open(CACHE_DIR / f"{k}.pkl", "wb") as f:
         pickle.dump(val, f)
 
-# ── Core retrieval ────────────────────────────────────────────────────────────
-def vec_search(query: str, n: int) -> list[str]:
-    hit, v = _cget("vs", query, n)
-    if hit:
-        return v
-    qv = embed_model.encode([query])[0].reshape(1, -1).astype(np.float32)
-    faiss.normalize_L2(qv)
-    _, idx = _faiss_index.search(qv, _faiss_index.ntotal)
-    result, seen = [], set()
-    for i in idx[0]:
-        if i < 0: continue
-        pid = _vector_pids[i]
+# ─────────────────────────────────────────────────────────────────────────────
+# Pre-compute ALL vector searches in one GPU batch pass
+# ─────────────────────────────────────────────────────────────────────────────
+def vec_values(budget: int) -> list[int]:
+    return sorted(set([1] + list(range(25, budget, 25)) + [budget]))
+
+ALL_VEC_NS = sorted(set(vn for b in BUDGETS for vn in vec_values(b)))
+
+print(f"Pre-computing {NQ} × {len(ALL_VEC_NS)} vector searches (single GPU pass)…")
+_qvecs = embed_model.encode(QUERIES, batch_size=NQ, normalize_embeddings=False,
+                             show_progress_bar=False).astype(np.float32)
+faiss.normalize_L2(_qvecs)
+_, _all_idx = _faiss_idx.search(_qvecs, _faiss_idx.ntotal)   # (NQ, ntotal)
+
+# Build sorted PID list per query, then slice to each needed vec_n
+_VEC_CACHE: dict[tuple, list[str]] = {}
+for qi, query in enumerate(QUERIES):
+    sorted_pids: list[str] = []
+    seen: set[str] = set()
+    for raw_i in _all_idx[qi]:
+        if raw_i < 0:
+            continue
+        pid = _vector_pids[raw_i]
         if pid not in seen:
-            seen.add(pid); result.append(pid)
-            if len(result) == n: break
-    _cput("vs", result, query, n)
-    return result
+            seen.add(pid)
+            sorted_pids.append(pid)
+    for vn in ALL_VEC_NS:
+        result = sorted_pids[:vn]
+        _VEC_CACHE[(query, vn)] = result
+        _cput("vs", result, query, vn)   # persist to disk cache too
+
+print(f"  Done. Startup took {time.time()-t0:.1f}s\n")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Retrieval functions
+# ─────────────────────────────────────────────────────────────────────────────
+_executor = ThreadPoolExecutor(max_workers=WORKERS)
+
+def vec_search(query: str, n: int) -> list[str]:
+    return _VEC_CACHE.get((query, n)) or _cget("vs", query, n)[1] or []
 
 def _bfs_seed(sid: str, k: int, hops: int) -> list[str]:
     hit, v = _cget("bfs", sid, k, hops)
-    if hit: return v
+    if hit:
+        return v
     channels = {
         "cites":    [("Paper", "CITES")],
         "coauthor": [("Paper", "WROTE"), ("Author", "WROTE")],
         "venue":    [("Paper", "PUBLISHED_IN"), ("Venue", "PUBLISHED_IN")],
         "field":    [("Paper", "HAS_FIELD"), ("FieldOfStudy", "HAS_FIELD")],
     }
-    ch_res = {}
+    ch_res: dict[str, list] = {}
     with driver.session() as session:
         for ch, plan in channels.items():
             queue   = deque([("Paper", sid, 0)])
             visited = {("Paper", sid)}
-            found   = []
+            found: list[str] = []
             while queue and len(found) < k:
                 label, nid, depth = queue.popleft()
-                if depth >= hops: continue
+                if depth >= hops:
+                    continue
                 if label == "Paper" and nid != sid:
                     found.append(nid)
                 for src, rel in plan:
-                    if label != src: continue
-                    q = f"MATCH (n:{label} {{id:$id}})-[:{rel}]-(m) RETURN labels(m)[0] AS l, m.id AS id"
+                    if label != src:
+                        continue
+                    q = (f"MATCH (n:{label} {{id:$id}})-[:{rel}]-(m) "
+                         "RETURN labels(m)[0] AS l, m.id AS id")
                     for r in session.run(q, id=nid):
                         key = (r["l"], r["id"])
                         if key not in visited:
@@ -186,70 +266,84 @@ def _bfs_seed(sid: str, k: int, hops: int) -> list[str]:
         for ch in channels:
             lst = ch_res[ch]
             if i < len(lst) and lst[i] not in seen:
-                seen.add(lst[i]); result.append(lst[i])
-                if len(result) == k: break
-        if len(result) == k: break
+                seen.add(lst[i])
+                result.append(lst[i])
+                if len(result) == k:
+                    break
+        if len(result) == k:
+            break
     _cput("bfs", result, sid, k, hops)
     return result
 
-def bfs_search(vec_ids: list[str], k: int, hops: int = BFS_HOPS) -> dict[str, list]:
-    results = {}
-    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        futs = {ex.submit(_bfs_seed, sid, k, hops): sid for sid in vec_ids}
-        for fut in as_completed(futs):
-            results[futs[fut]] = fut.result()
-    return results
+def bfs_search(vec_ids: list[str], k: int) -> dict[str, list[str]]:
+    if k == 0:
+        return {sid: [] for sid in vec_ids}
+    futs = {_executor.submit(_bfs_seed, sid, k, BFS_HOPS): sid for sid in vec_ids}
+    return {futs[f]: f.result() for f in as_completed(futs)}
 
-def _meta_seed(query: str, sid: str, k: int, hops: int) -> list[str]:
-    hit, v = _cget("meta", query, sid, k, hops)
-    if hit: return v
+def _meta_seed(query: str, sid: str, k: int) -> list[str]:
+    hit, v = _cget("meta", query, sid, k, META_HOPS)
+    if hit:
+        return v
     try:
-        neighbors = metapath_graph.retrieve(query, sid, k=k, max_hops=hops)
+        neighbors = metapath_graph.retrieve(query, sid, k=k, max_hops=META_HOPS)
         result = [n["paper_id"] for n in neighbors]
     except Exception:
         result = []
-    _cput("meta", result, query, sid, k, hops)
+    _cput("meta", result, query, sid, k, META_HOPS)
     return result
 
-def meta_search(vec_ids: list[str], query: str, k: int,
-                hops: int = META_HOPS) -> dict[str, list]:
-    results = {}
-    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        futs = {ex.submit(_meta_seed, query, sid, k, hops): sid for sid in vec_ids}
-        for fut in as_completed(futs):
-            results[futs[fut]] = fut.result()
-    return results
+def meta_search(vec_ids: list[str], query: str, k: int) -> dict[str, list[str]]:
+    if k == 0:
+        return {sid: [] for sid in vec_ids}
+    futs = {_executor.submit(_meta_seed, query, sid, k): sid for sid in vec_ids}
+    return {futs[f]: f.result() for f in as_completed(futs)}
 
-def unique_pool(vec_ids: list[str], graph: dict[str, list]) -> list[str]:
+def unique_pool(vec_ids: list[str], graph: dict[str, list[str]]) -> list[str]:
     pool, seen = list(vec_ids), set(vec_ids)
     for sid in vec_ids:
         for pid in graph.get(sid, []):
             if pid not in seen:
-                seen.add(pid); pool.append(pid)
+                seen.add(pid)
+                pool.append(pid)
     return pool
 
-def do_rerank(pool: list[str], query: str, top_k: int = 10) -> list[str]:
-    cands = [p for p in pool if p in ground_truth_pids]
-    if not cands: return []
-    hit, v = _cget("rr", query, tuple(sorted(cands)), top_k)
-    if hit: return v
-    pairs = [(query, (all_papers[p]["title"] + " " + all_papers[p]["abstract"]).strip())
-             for p in cands if p in all_papers]
-    valid = [p for p in cands if p in all_papers]
-    if not pairs: return []
-    scores = reranker_model.predict(pairs)
-    result = [valid[i] for i in np.argsort(scores)[::-1]][:top_k]
-    _cput("rr", result, query, tuple(sorted(cands)), top_k)
-    return result
+# ─────────────────────────────────────────────────────────────────────────────
+# Batch CrossEncoder — score all NQ queries in one GPU inference call
+# ─────────────────────────────────────────────────────────────────────────────
+def rerank_all(cands_by_qi: list[list[str]]) -> list[list[str]]:
+    """
+    cands_by_qi[qi] = ground-truth paper IDs in the pool for query qi.
+    Returns top-10 ranked IDs for each query in a single GPU pass.
+    """
+    all_pairs: list[tuple] = []
+    pair_meta: list[tuple] = []   # (qi, pid)
+    for qi, (query, cands) in enumerate(zip(QUERIES, cands_by_qi)):
+        for pid in cands:
+            p = all_papers.get(pid)
+            if p:
+                all_pairs.append((query, (p["title"] + " " + p["abstract"]).strip()))
+                pair_meta.append((qi, pid))
 
-# ── Rankers ───────────────────────────────────────────────────────────────────
-def rank_reranker(pool, vec_ids, graph, query):
-    return do_rerank(pool, query)
+    if not all_pairs:
+        return [[] for _ in QUERIES]
 
+    scores = reranker_model.predict(all_pairs, batch_size=512, show_progress_bar=False)
+
+    qi_scored: dict[int, list] = {i: [] for i in range(NQ)}
+    for (qi, pid), sc in zip(pair_meta, scores):
+        qi_scored[qi].append((float(sc), pid))
+
+    return [[pid for _, pid in sorted(qi_scored[qi], reverse=True)[:10]]
+            for qi in range(NQ)]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Rankers
+# ─────────────────────────────────────────────────────────────────────────────
 def rank_freq(pool, vec_ids, graph, query):
     freq = Counter(vec_ids)
-    for sid, neighbors in graph.items():
-        for pid in neighbors:
+    for nbrs in graph.values():
+        for pid in nbrs:
             freq[pid] += 1
     vr = {p: i for i, p in enumerate(vec_ids)}
     gt = [p for p in freq if p in ground_truth_pids]
@@ -258,7 +352,8 @@ def rank_freq(pool, vec_ids, graph, query):
 def rank_interleave(pool, vec_ids, graph, query):
     seen, ordered = set(), []
     for v in vec_ids:
-        if v not in seen: seen.add(v); ordered.append(v)
+        if v not in seen:
+            seen.add(v); ordered.append(v)
     mx = max((len(g) for g in graph.values()), default=0)
     for i in range(mx):
         for v in vec_ids:
@@ -267,54 +362,43 @@ def rank_interleave(pool, vec_ids, graph, query):
                 seen.add(nbrs[i]); ordered.append(nbrs[i])
     return [p for p in ordered if p in ground_truth_pids][:10]
 
-RANKERS = {
-    "reranker":   rank_reranker,
-    "freq":       rank_freq,
-    "interleave": rank_interleave,
-}
-
-# ── Metrics ───────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Metrics
+# ─────────────────────────────────────────────────────────────────────────────
 def mrr5(ranked, relevant):
     for i, p in enumerate(ranked[:5]):
-        if p in relevant: return 1.0 / (i + 1)
+        if p in relevant:
+            return 1.0 / (i + 1)
     return 0.0
 
 def recall(ranked, relevant, k):
     return len(set(ranked[:k]) & relevant) / len(relevant) if relevant else 0.0
 
-# ── Pool-size measurement ─────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# GRAPH_K auto-tuner
+# ─────────────────────────────────────────────────────────────────────────────
 def measure_pool(vec_n: int, gk: int, rtype: str) -> float:
-    """Average deduped pool size over the first TUNE_QUERIES queries."""
     sizes = []
-    for query in QUERIES[:TUNE_QUERIES]:
-        vids = vec_search(query, vec_n)
+    for query in QUERIES[:TUNE_N]:
+        vids  = vec_search(query, vec_n)
         graph = (bfs_search(vids, gk) if rtype == "bfs"
                  else meta_search(vids, query, gk))
         sizes.append(len(unique_pool(vids, graph)))
     return float(np.mean(sizes))
 
-# ── GRAPH_K auto-tuner ────────────────────────────────────────────────────────
 def autotune_gk(vec_n: int, budget: int, rtype: str) -> tuple[int, float]:
-    """
-    Binary-search for GRAPH_K so measured pool ≈ budget ± TOLERANCE.
-    If search bounces, use the smallest GK whose pool is ≥ budget.
-    Returns (graph_k, actual_avg_pool).
-    """
-    lo, hi = 0, MAX_GK
-    history: list[int] = []
-    last_above = MAX_GK   # smallest GK seen that overshoots (fallback)
+    lo, hi         = 0, MAX_GK
+    history: list  = []
+    last_above      = MAX_GK
 
     while lo <= hi:
         k = (lo + hi) // 2
         if k in history:
-            # Bouncing — set to last_above (pool slightly over budget)
             actual = measure_pool(vec_n, last_above, rtype)
             return last_above, actual
         history.append(k)
-
         actual = measure_pool(vec_n, k, rtype)
         err    = (actual - budget) / budget
-
         if abs(err) <= TOLERANCE:
             return k, actual
         elif actual < budget:
@@ -323,29 +407,20 @@ def autotune_gk(vec_n: int, budget: int, rtype: str) -> tuple[int, float]:
             last_above = min(last_above, k)
             hi = k - 1
 
-    # Binary search exhausted without convergence
     actual = measure_pool(vec_n, last_above, rtype)
     return last_above, actual
 
-# ── CSV writer ────────────────────────────────────────────────────────────────
-FIELDNAMES = [
+# ─────────────────────────────────────────────────────────────────────────────
+# CSV helpers
+# ─────────────────────────────────────────────────────────────────────────────
+FIELDS = [
     "budget", "vec_n", "graph_k", "retrieval_type", "ranker",
     "actual_avg_pool", "query_id",
     "mrr5", "recall5", "recall10", "n_relevant_in_pool", "pool_size",
 ]
 
-def open_csv():
-    exists = SWEEP_CSV.exists()
-    f = open(SWEEP_CSV, "a", newline="", encoding="utf-8")
-    w = csv.DictWriter(f, fieldnames=FIELDNAMES)
-    if not exists:
-        w.writeheader()
-    return f, w
-
-# ── Already-done check ────────────────────────────────────────────────────────
-def load_done() -> set[tuple]:
-    """Return set of (budget, vec_n, retrieval_type, ranker) already in CSV."""
-    done = set()
+def load_done() -> set:
+    done: set = set()
     if not SWEEP_CSV.exists():
         return done
     with open(SWEEP_CSV, encoding="utf-8") as f:
@@ -354,119 +429,169 @@ def load_done() -> set[tuple]:
                       row["retrieval_type"], row["ranker"]))
     return done
 
-# ── VEC sweep points ──────────────────────────────────────────────────────────
-def vec_values(budget: int) -> list[int]:
-    """[1, 25, 50, ..., budget]  — always include 1 and budget."""
-    return sorted(set([1] + list(range(25, budget, 25)) + [budget]))
-
-# ── Main sweep ────────────────────────────────────────────────────────────────
-def run_config(vec_ids, graph, pool, query, rtype, ranker_name, ranker_fn,
-               budget, vec_n, gk, avg_pool, qi):
-    relevant = relevance_by_query.get(qi + 1, set())
-    top10    = ranker_fn(pool, vec_ids, graph, query)
-    return {
-        "budget":           budget,
-        "vec_n":            vec_n,
-        "graph_k":          gk,
-        "retrieval_type":   rtype,
-        "ranker":           ranker_name,
-        "actual_avg_pool":  round(avg_pool, 1),
-        "query_id":         qi + 1,
-        "mrr5":             round(mrr5(top10, relevant), 4),
-        "recall5":          round(recall(top10, relevant, 5), 4),
-        "recall10":         round(recall(top10, relevant, 10), 4),
-        "n_relevant_in_pool": len(set(pool) & relevant),
-        "pool_size":        len(pool),
-    }
+# ─────────────────────────────────────────────────────────────────────────────
+# Main sweep
+# ─────────────────────────────────────────────────────────────────────────────
+def make_rows(budget, vec_n, gk, rtype, avg_pool,
+              all_vids, all_graphs, all_pools,
+              reranked_by_qi, freq_by_qi, interleave_by_qi,
+              done) -> list[dict]:
+    rows = []
+    for ranker_name, top10_by_qi in [
+        ("reranker",   reranked_by_qi),
+        ("freq",       freq_by_qi),
+        ("interleave", interleave_by_qi),
+    ]:
+        if (budget, vec_n, rtype, ranker_name) in done:
+            continue
+        for qi in range(NQ):
+            relevant = relevance_by_query.get(qi + 1, set())
+            top10    = top10_by_qi[qi]
+            pool     = all_pools[qi]
+            rows.append({
+                "budget":           budget,
+                "vec_n":            vec_n,
+                "graph_k":          gk,
+                "retrieval_type":   rtype,
+                "ranker":           ranker_name,
+                "actual_avg_pool":  round(avg_pool, 1),
+                "query_id":         qi + 1,
+                "mrr5":             round(mrr5(top10, relevant), 4),
+                "recall5":          round(recall(top10, relevant, 5), 4),
+                "recall10":         round(recall(top10, relevant, 10), 4),
+                "n_relevant_in_pool": len(set(pool) & relevant),
+                "pool_size":        len(pool),
+            })
+    return rows
 
 def main():
     done = load_done()
-    csv_f, csv_w = open_csv()
+    exists = SWEEP_CSV.exists()
+    csv_f  = open(SWEEP_CSV, "a", newline="", encoding="utf-8")
+    csv_w  = csv.DictWriter(csv_f, fieldnames=FIELDS)
+    if not exists:
+        csv_w.writeheader()
+
+    total_points = sum(len(vec_values(b)) for b in BUDGETS)
+    done_points  = 0
 
     try:
         for budget in BUDGETS:
-            print(f"\n{'='*64}")
-            print(f"Budget = {budget}")
-            print(f"{'='*64}")
+            if _shutdown: break
+            print(f"\n{'='*64}\nBudget = {budget}\n{'='*64}")
 
             for vec_n in vec_values(budget):
+                if _shutdown: break
+                done_points += 1
+                pct = 100 * done_points / total_points
 
-                # ── Pure vector (vec_n == budget, no graph) ───────────────
+                # ── Pure vector ───────────────────────────────────────────
                 if vec_n == budget:
-                    for ranker_name in ("reranker", "none"):
-                        if (budget, vec_n, "vector", ranker_name) in done:
-                            print(f"  [SKIP] vector/{ranker_name} vec={vec_n}")
-                            continue
-                        print(f"  vector/{ranker_name}  vec={vec_n}", flush=True)
-                        avg_pool = float(vec_n)
+                    skip_r = (budget, vec_n, "vector", "reranker") in done
+                    skip_n = (budget, vec_n, "vector", "none")     in done
+                    if skip_r and skip_n:
+                        print(f"  [{pct:.0f}%] SKIP vector vec={vec_n}")
+                    else:
+                        print(f"  [{pct:.0f}%] vector vec={vec_n}", flush=True)
+                        all_vids = [vec_search(q, vec_n) for q in QUERIES]
+                        # Batch rerank all queries
+                        gt_cands = [[p for p in vids if p in ground_truth_pids]
+                                    for vids in all_vids]
+                        reranked = rerank_all(gt_cands)
                         rows = []
-                        for qi, query in enumerate(QUERIES):
-                            vids  = vec_search(query, vec_n)
-                            pool  = vids
-                            graph = {}
-                            if ranker_name == "reranker":
-                                top10 = do_rerank(pool, query)
-                            else:
-                                top10 = [p for p in pool if p in ground_truth_pids][:10]
+                        for qi in range(NQ):
+                            pool     = all_vids[qi]
                             relevant = relevance_by_query.get(qi + 1, set())
-                            rows.append({
-                                "budget": budget, "vec_n": vec_n, "graph_k": 0,
-                                "retrieval_type": "vector", "ranker": ranker_name,
-                                "actual_avg_pool": avg_pool,
-                                "query_id": qi + 1,
-                                "mrr5":    round(mrr5(top10, relevant), 4),
-                                "recall5": round(recall(top10, relevant, 5), 4),
-                                "recall10":round(recall(top10, relevant, 10), 4),
-                                "n_relevant_in_pool": len(set(pool) & relevant),
-                                "pool_size": len(pool),
-                            })
-                        csv_w.writerows(rows)
-                        csv_f.flush()
+                            for ranker_name, top10 in [
+                                ("reranker", reranked[qi]),
+                                ("none", [p for p in pool if p in ground_truth_pids][:10]),
+                            ]:
+                                if (budget, vec_n, "vector", ranker_name) in done:
+                                    continue
+                                rows.append({
+                                    "budget": budget, "vec_n": vec_n, "graph_k": 0,
+                                    "retrieval_type": "vector", "ranker": ranker_name,
+                                    "actual_avg_pool": float(vec_n),
+                                    "query_id": qi + 1,
+                                    "mrr5":    round(mrr5(top10, relevant), 4),
+                                    "recall5": round(recall(top10, relevant, 5), 4),
+                                    "recall10":round(recall(top10, relevant, 10), 4),
+                                    "n_relevant_in_pool": len(set(pool) & relevant),
+                                    "pool_size": len(pool),
+                                })
+                        csv_w.writerows(rows); csv_f.flush()
 
                 # ── BFS hybrid ────────────────────────────────────────────
-                if (budget, vec_n, "bfs", "reranker") not in done:
-                    gk_bfs, avg_bfs = autotune_gk(vec_n, budget, "bfs")
-                    print(f"  bfs  vec={vec_n}  gk={gk_bfs}  avg_pool={avg_bfs:.1f}",
-                          flush=True)
-                    for qi, query in enumerate(QUERIES):
-                        vids  = vec_search(query, vec_n)
-                        graph = bfs_search(vids, gk_bfs)
-                        pool  = unique_pool(vids, graph)
-                        for rname, rfn in RANKERS.items():
-                            if (budget, vec_n, "bfs", rname) in done:
-                                continue
-                            csv_w.writerow(run_config(
-                                vids, graph, pool, query,
-                                "bfs", rname, rfn,
-                                budget, vec_n, gk_bfs, avg_bfs, qi))
-                    csv_f.flush()
+                all_bfs_done = all(
+                    (budget, vec_n, "bfs", r) in done
+                    for r in ("reranker", "freq", "interleave")
+                )
+                if all_bfs_done:
+                    print(f"  [{pct:.0f}%] SKIP bfs vec={vec_n}")
                 else:
-                    print(f"  [SKIP] bfs vec={vec_n}")
+                    gk_bfs, avg_bfs = autotune_gk(vec_n, budget, "bfs")
+                    print(f"  [{pct:.0f}%] bfs  vec={vec_n} gk={gk_bfs} "
+                          f"pool≈{avg_bfs:.0f}", flush=True)
+
+                    # Retrieve for all queries
+                    all_vids   = [vec_search(q, vec_n) for q in QUERIES]
+                    all_graphs = [bfs_search(vids, gk_bfs) for vids in all_vids]
+                    all_pools  = [unique_pool(v, g) for v, g in zip(all_vids, all_graphs)]
+
+                    # Batch rerank (single GPU call)
+                    gt_cands    = [[p for p in pool if p in ground_truth_pids]
+                                   for pool in all_pools]
+                    reranked    = rerank_all(gt_cands)
+                    freq_top10  = [rank_freq(all_pools[qi], all_vids[qi],
+                                             all_graphs[qi], QUERIES[qi])
+                                   for qi in range(NQ)]
+                    inter_top10 = [rank_interleave(all_pools[qi], all_vids[qi],
+                                                    all_graphs[qi], QUERIES[qi])
+                                   for qi in range(NQ)]
+
+                    rows = make_rows(budget, vec_n, gk_bfs, "bfs", avg_bfs,
+                                     all_vids, all_graphs, all_pools,
+                                     reranked, freq_top10, inter_top10, done)
+                    csv_w.writerows(rows); csv_f.flush()
 
                 # ── Metapath hybrid ───────────────────────────────────────
-                if (budget, vec_n, "metapath", "reranker") not in done:
-                    gk_meta, avg_meta = autotune_gk(vec_n, budget, "metapath")
-                    print(f"  meta vec={vec_n}  gk={gk_meta}  avg_pool={avg_meta:.1f}",
-                          flush=True)
-                    for qi, query in enumerate(QUERIES):
-                        vids  = vec_search(query, vec_n)
-                        graph = meta_search(vids, query, gk_meta)
-                        pool  = unique_pool(vids, graph)
-                        for rname, rfn in RANKERS.items():
-                            if (budget, vec_n, "metapath", rname) in done:
-                                continue
-                            csv_w.writerow(run_config(
-                                vids, graph, pool, query,
-                                "metapath", rname, rfn,
-                                budget, vec_n, gk_meta, avg_meta, qi))
-                    csv_f.flush()
+                all_meta_done = all(
+                    (budget, vec_n, "metapath", r) in done
+                    for r in ("reranker", "freq", "interleave")
+                )
+                if all_meta_done:
+                    print(f"  [{pct:.0f}%] SKIP metapath vec={vec_n}")
                 else:
-                    print(f"  [SKIP] metapath vec={vec_n}")
+                    gk_meta, avg_meta = autotune_gk(vec_n, budget, "metapath")
+                    print(f"  [{pct:.0f}%] meta vec={vec_n} gk={gk_meta} "
+                          f"pool≈{avg_meta:.0f}", flush=True)
+
+                    all_vids   = [vec_search(q, vec_n) for q in QUERIES]
+                    all_graphs = [meta_search(vids, QUERIES[qi], gk_meta)
+                                  for qi, vids in enumerate(all_vids)]
+                    all_pools  = [unique_pool(v, g) for v, g in zip(all_vids, all_graphs)]
+
+                    gt_cands    = [[p for p in pool if p in ground_truth_pids]
+                                   for pool in all_pools]
+                    reranked    = rerank_all(gt_cands)
+                    freq_top10  = [rank_freq(all_pools[qi], all_vids[qi],
+                                             all_graphs[qi], QUERIES[qi])
+                                   for qi in range(NQ)]
+                    inter_top10 = [rank_interleave(all_pools[qi], all_vids[qi],
+                                                    all_graphs[qi], QUERIES[qi])
+                                   for qi in range(NQ)]
+
+                    rows = make_rows(budget, vec_n, gk_meta, "metapath", avg_meta,
+                                     all_vids, all_graphs, all_pools,
+                                     reranked, freq_top10, inter_top10, done)
+                    csv_w.writerows(rows); csv_f.flush()
 
     finally:
         csv_f.close()
+        _executor.shutdown(wait=False)
 
-    print(f"\nDone. Results saved to:\n  {SWEEP_CSV}")
+    print(f"\nDone in {(time.time()-t0)/60:.1f} min")
+    print(f"Results: {SWEEP_CSV}")
 
 if __name__ == "__main__":
     main()
