@@ -26,7 +26,10 @@ PY         = str(VENV / "Scripts" / "python.exe")
 PIP        = str(VENV / "Scripts" / "pip.exe")
 DUMP_DIR   = ROOT / "transfer"
 NEO4J_DIR  = pathlib.Path("C:/neo4j")
-NEO4J_PASS = "Thammu123"
+NEO4J_PASS = os.environ.get("NEO4J_PASS", "")
+if not NEO4J_PASS:
+    import getpass
+    NEO4J_PASS = getpass.getpass("Enter Neo4j password to set: ")
 BASE_PY    = str(pathlib.Path(sys.executable).parent / "python.exe")
 
 def banner(msg): print(f"\n{'='*60}\n==> {msg}\n{'='*60}", flush=True)

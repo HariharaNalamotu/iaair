@@ -1,12 +1,39 @@
-pymilvus==2.6.5
-sentence-transformers==5.2.0
-neo4j==6.1.0
-python-dotenv==1.2.1
-numpy==2.4.0
-matplotlib==3.10.8
-tiktoken==0.12.0
-pypdf==6.5.0
-requests==2.32.5
-torch==2.9.1
-transformers==4.57.3
-huggingface-hub==0.36.0
+# IAAIR — Python dependencies
+# Install in the project venv:
+#   pip install -r requirements.txt
+#
+# GPU (CUDA 12.8) build of PyTorch — required for SciBERT and CrossEncoder:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+
+# Core ML
+torch>=2.11.0
+sentence-transformers>=5.0.0
+transformers>=4.40.0
+huggingface-hub>=0.20.0
+
+# Vector search
+faiss-cpu>=1.7.4
+
+# Graph database
+neo4j>=5.0.0
+
+# Milvus Lite (WSL2 / Linux only — for scripts/extract_vectors.py)
+# pymilvus[milvus_lite]>=2.4.0
+
+# Data / evaluation
+numpy>=1.26.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+tqdm>=4.66.0
+
+# Chunking and PDF processing
+tiktoken>=0.5.0
+pypdf>=4.0.0
+
+# Visualisation
+matplotlib>=3.8.0
+seaborn>=0.13.0
+
+# Utilities
+python-dotenv>=1.0.0
+requests>=2.31.0

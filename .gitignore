@@ -1,25 +1,38 @@
+# Credentials — never commit
 .env
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
+
+# Large databases
 RAG.db
 *.lock
+transfer/neo4j.dump
+
+# Python virtual environment
 .venv/
-semantic_scholar_corpus/pdfs/
-.DS_Store
-.claude/
-.ipynb_checkpoints/
-ingestion/ingestion_state.json
 
-# Evaluation disk cache — regenerated automatically on each run
-results/eval_cache/
-
-# Large generated files — not stored in git
+# Large generated data files — reproduce with:
+#   scripts/extract_vectors.py       (WSL2, one-time)
+#   scripts/precompute_embeddings.py (GPU)
 data/vectors.npy
 data/vector_paperids.json
 data/paper_embeddings.npy
 data/paper_ids.json
 data/_extract_checkpoint.json
 
-# Neo4j dump — large binary, only needed for initial setup
-transfer/neo4j.dump
+# Evaluation cache — auto-regenerated on eval runs
+results/eval_cache/
+
+# PDF corpus — not redistributed
+semantic_scholar_corpus/pdfs/
+
+# OS / editor
+.DS_Store
+.claude/
+.ipynb_checkpoints/
+
+# Ingestion checkpoint — machine-specific state
+ingestion/ingestion_state.json
