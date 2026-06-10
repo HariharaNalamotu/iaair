@@ -52,10 +52,10 @@ def main():
         print("  WARNING: CUDA not available — running on CPU (will be slow).")
 
     print(f"Loading model {MODEL_NAME} ...")
+    # FP32 throughout: FP16 (model.half()) is ~2x faster but hardware-dependent,
+    # which breaks bit-level reproducibility across GPUs. The cost is a few extra
+    # seconds; the benefit is a deterministic embedding cache.
     model = SentenceTransformer(MODEL_NAME, device=device)
-    # Enable FP16 on GPU for ~2x throughput with no quality loss on embeddings
-    if device == "cuda":
-        model = model.half()
 
     # ── Encode ────────────────────────────────────────────────────────────────
     print(f"Encoding {len(paper_texts)} papers (batch_size={BATCH_SIZE}) ...")

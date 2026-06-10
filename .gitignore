@@ -14,9 +14,10 @@ transfer/neo4j.dump
 # Python virtual environment
 .venv/
 
-# Large generated data files — reproduce with:
-#   scripts/extract_vectors.py       (WSL2, one-time)
-#   scripts/precompute_embeddings.py (GPU)
+# Large generated data files — fully reproducible from committed inputs:
+#   scripts/build_vectors.py         data/vector_chunks.csv.gz -> vectors.npy
+#   scripts/precompute_embeddings.py data/papers.csv          -> paper_embeddings.npy
+# (data/vector_chunks.csv.gz IS committed — it is the frozen source text.)
 data/vectors.npy
 data/vector_paperids.json
 data/paper_embeddings.npy
