@@ -197,17 +197,6 @@ cc8f57972cb90afe41ca405973370225fbd591220fb0668d4ce19d4eecbe0e5c  data/written_f
 d566c89d34dbeb732d141ce5d8b13e12b84901cf9ba7493f3645701e3dabb281  data/vector_chunks.csv.gz
 ```
 
-### Known artifact: out-of-corpus ("orphan") vectors
-
-The FAISS index holds 56,379 vectors from 1,398 papers, but the declared corpus is 1,500 papers:
-258 corpus papers contribute no vector (no abstract, no PDF), and **156 vector-source papers
-are not in the corpus** (papers *cited by* the corpus that were embedded during an earlier,
-larger ingestion). These account for ~50% of the index. They **never enter a scored result** —
-every method filters its pool to judged papers before re-ranking — but they do occupy ~23% of
-each raw vector pool, which mildly handicaps the vector baseline on coverage (i.e. the artifact
-is *conservative* with respect to the negative result). Their exact text is frozen in
-`vector_chunks.csv.gz`, so the index reproduces precisely as evaluated.
-
 ### (Optional) Rebuilding from scratch via the live API
 
 `ingestion/run_ingestion.py` documents how the corpus was originally grown by citation BFS from
