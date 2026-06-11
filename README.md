@@ -1,7 +1,7 @@
 # Hybrid Graph–Vector Retrieval for Scientific Papers
 ### A Budget-Controlled Evaluation of Whether a Knowledge Graph Improves Retrieval
 
-**Author:** Hari Nalamotu · Institute of Applied Artificial Intelligence and Robotics (IAAIR)
+**Author:** Hari Nalamotu
 
 This repository contains the full corpus, code, and evaluation for a controlled study of
 whether augmenting dense vector retrieval with a citation/authorship/venue/field knowledge
